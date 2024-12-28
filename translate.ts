@@ -2,6 +2,8 @@
 
 import { load } from "https://deno.land/std@0.224.0/dotenv/mod.ts";
 
+type TranslationProvider = "openai" | "ollama";
+
 export async function copy(text: string): Promise<void> {
   const cmd = new Deno.Command("wl-copy", {
     stdin: "piped",
@@ -44,33 +46,59 @@ async function notify(message: string, timeout: number = 2000): Promise<void> {
   }
 }
 
-async function translate(text: string, systemPrompt: string): Promise<string> {
+async function translate(
+  text: string,
+  systemPrompt: string,
+  provider: TranslationProvider = "openai",
+): Promise<string> {
   const apiKey = Deno.env.get("OPENAI_API_KEY");
-  if (!apiKey) {
+
+  const specificSystem = `${systemPrompt}. Do not include any other explanation`;
+
+  if (provider === "openai" && !apiKey) {
     throw new Error("OPENAI_API_KEY must be set in your environment");
   }
 
-  const response = await fetch("https://api.openai.com/v1/chat/completions", {
-    method: "POST",
-    headers: {
-      "Content-Type": "application/json",
+  const url = provider === "ollama"
+    ? "http://localhost:11434/api/generate"
+    : "https://api.openai.com/v1/chat/completions";
+
+  const headers = {
+    "Content-Type": "application/json",
+    ...(provider === "ollama" ? {} : {
       "Authorization": `Bearer ${apiKey}`,
-    },
-    body: JSON.stringify({
+    }),
+  };
+
+  const body = provider === "ollama"
+    ? JSON.stringify({
+      prompt: `${specificSystem}\n${text}`,
+      model: "llama3.1:8b",
+      stream: false,
+    })
+    : JSON.stringify({
       model: DEFAULT_MODEL,
       messages: [
         { role: "system", content: systemPrompt },
         { role: "user", content: text },
       ],
-    }),
+    });
+
+  const response = await fetch(url, {
+    method: "POST",
+    headers,
+    body,
   });
 
   const data = await response.json();
+  if (provider === "ollama") {
+    return data.response;
+  }
   return data.choices[0].message.content;
 }
 
 function sanitize(text: string): string {
-  return text.replace(/\r\n/g, '\n').replace('\r', '');
+  return text.replace(/\r\n/g, "\n").replace("\r", "");
 }
 
 async function main() {
@@ -88,14 +116,21 @@ async function main() {
       throw new Error("No text found in clipboard.");
     }
 
+    const provider: TranslationProvider =
+      Deno.env.get("TRANSLATE_PROVIDER") as TranslationProvider || "openai";
     const sanitizedText = sanitize(textFromClipboard);
 
-    const translatedText = await translate(sanitizedText, systemPrompt);
+    const translatedText = await translate(
+      sanitizedText,
+      systemPrompt,
+      provider,
+    );
 
     await copy(translatedText);
     await notify("Translation copied to clipboard.", 5000);
   } catch (error) {
     if (error instanceof Error) {
+      console.error(error.stack || error.message);
       await notify(`Error: ${error.message}`);
     } else {
       throw error;
