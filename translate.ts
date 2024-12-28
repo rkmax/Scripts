@@ -69,6 +69,10 @@ async function translate(text: string, systemPrompt: string): Promise<string> {
   return data.choices[0].message.content;
 }
 
+function sanitize(text: string): string {
+  return text.replace(/\r\n/g, '\n').replace('\r', '');
+}
+
 async function main() {
   await load({ export: true });
 
@@ -84,7 +88,9 @@ async function main() {
       throw new Error("No text found in clipboard.");
     }
 
-    const translatedText = await translate(textFromClipboard, systemPrompt);
+    const sanitizedText = sanitize(textFromClipboard);
+
+    const translatedText = await translate(sanitizedText, systemPrompt);
 
     await copy(translatedText);
     await notify("Translation copied to clipboard.", 5000);
