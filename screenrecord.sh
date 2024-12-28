@@ -30,7 +30,7 @@ function start_recording() {
   if [ -z "$selection" ]; then
     echo "No area selected. Video recording canceled."
     if [ -x "$(command -v notify-send)" ]; then
-      notify-send "Video recording canceled" "No area was selected."
+      notify-send -r "344522" "Video recording canceled" "No area was selected."
     fi
     exit 1
   fi
@@ -46,7 +46,7 @@ function start_recording() {
 
   if [ $? -eq 0 ]; then
     if [ -x "$(command -v notify-send)" ]; then
-      notify-send "Recording saved" "$filepath"
+      notify-send -r "344522" "Recording saved" "$filepath"
     fi
 
     if $copy_to_clipboard; then
@@ -54,7 +54,7 @@ function start_recording() {
         wl-copy < "$filepath"
         echo "Recording copied to clipboard."
         if [ -x "$(command -v notify-send)" ]; then
-          notify-send "Recording copied to clipboard" "$filepath"
+          notify-send -r "344522" "Recording copied to clipboard" "$filepath"
         fi
       else
         echo "wl-copy is not installed. Install it with 'sudo pacman -S wl-clipboard'."
@@ -64,7 +64,7 @@ function start_recording() {
   else
     echo "wf-recorder failed to record video."
     if [ -x "$(command -v notify-send)" ]; then
-      notify-send "Recording failed" "wf-recorder encountered an error."
+      notify-send -r "344522" "Recording failed" "wf-recorder encountered an error."
     fi
     exit 1
   fi
@@ -77,7 +77,7 @@ function stop_recording() {
     if [ $? -eq 0 ]; then
       echo "Recording process (PID: $pid) stopped."
       if [ -x "$(command -v notify-send)" ]; then
-        notify-send "Recording stopped" "Recording process was terminated."
+        notify-send -r "344522" "Recording stopped" "Recording process was terminated."
       fi
     else
       echo "Failed to stop recording process (PID: $pid)."

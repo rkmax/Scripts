@@ -40,7 +40,14 @@ async function notify(message: string, timeout: number = 2000): Promise<void> {
   if (Deno.build.os === "windows") {
     console.log(message);
   } else {
-    const args = ["-t", timeout.toString(), "Translate", message];
+    const args = [
+      "-r",
+      "417037",
+      "-t",
+      timeout.toString(),
+      "Translate",
+      message,
+    ];
     const cmd = new Deno.Command("notify-send", { args });
     await cmd.output();
   }
@@ -53,7 +60,9 @@ async function translate(
 ): Promise<string> {
   const apiKey = Deno.env.get("OPENAI_API_KEY");
 
-  const specificSystem = `${systemPrompt}. Do not include any other explanation`;
+  const specificSystem =
+    `${systemPrompt}. Do not include any other explanation`;
+  const specificUser = `User: ${text}`;
 
   if (provider === "openai" && !apiKey) {
     throw new Error("OPENAI_API_KEY must be set in your environment");
@@ -72,7 +81,7 @@ async function translate(
 
   const body = provider === "ollama"
     ? JSON.stringify({
-      prompt: `${specificSystem}\n${text}`,
+      prompt: `${specificSystem}\n${specificUser}`,
       model: "llama3.1:8b",
       stream: false,
     })
@@ -120,17 +129,23 @@ async function main() {
       Deno.env.get("TRANSLATE_PROVIDER") as TranslationProvider || "openai";
     const sanitizedText = sanitize(textFromClipboard);
 
+    const startTime = performance.now();
     const translatedText = await translate(
       sanitizedText,
       systemPrompt,
       provider,
     );
 
+    const endTime = performance.now();
+    const duration = endTime - startTime;
+
     await copy(translatedText);
-    await notify("Translation copied to clipboard.", 5000);
+    await notify(
+      `Translation copied to clipboard. Done (${duration.toFixed(4)}ms)`,
+      5000,
+    );
   } catch (error) {
     if (error instanceof Error) {
-      console.error(error.stack || error.message);
       await notify(`Error: ${error.message}`);
     } else {
       throw error;

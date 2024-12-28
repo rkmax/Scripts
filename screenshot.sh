@@ -20,7 +20,7 @@ selection=$(slurp)
 if [ -z "$selection" ]; then
   echo "No area selected. Screenshot canceled."
   if [ -x "$(command -v notify-send)" ]; then
-    notify-send "Screenshot canceled" "No area was selected."
+    notify-send -r "344521" "Screenshot canceled" "No area was selected."
   fi
   exit 1
 fi
@@ -28,7 +28,7 @@ fi
 grim -g "$selection" "$filepath"
 
 if [ -x "$(command -v notify-send)" ]; then
-  notify-send "Screenshot saved" "$filepath"
+  notify-send -r "344521" "Screenshot saved" "$filepath"
 fi
 
 if $copy_to_clipboard; then
@@ -36,7 +36,7 @@ if $copy_to_clipboard; then
         wl-copy < "$filepath"
         echo "Screenshot copied to clipboard."
         if [ -x "$(command -v notify-send)" ]; then
-          notify-send "Screenshot copied to clipboard" "$filepath"
+          notify-send -r "344521"  "Screenshot copied to clipboard" "$filepath"
         fi
     else
         echo "wl-copy is not installed. Install it with 'sudo pacman -S wl-clipboard'."
