@@ -1,36 +1,9 @@
 #!/usr/bin/env -S deno run --allow-net --allow-env --allow-run --allow-read --allow-write
 
 import { load } from "https://deno.land/std@0.224.0/dotenv/mod.ts";
+import { copy, paste } from "./encode-json.ts";
 
 type TranslationProvider = "openai" | "ollama";
-
-export async function copy(text: string): Promise<void> {
-  const cmd = new Deno.Command("wl-copy", {
-    stdin: "piped",
-  });
-  const process = cmd.spawn();
-  const writer = process.stdin.getWriter();
-  await writer.write(new TextEncoder().encode(text));
-  await writer.close();
-  const status = await process.status;
-  if (!status.success) {
-    throw new Error("Failed to copy to clipboard");
-  }
-}
-
-export async function paste(): Promise<string> {
-  const cmd = new Deno.Command("wl-paste", {
-    args: ["-n"],
-    stdout: "piped",
-  });
-  const process = cmd.spawn();
-  const output = await process.output();
-  const status = await process.status;
-  if (!status.success) {
-    throw new Error("Failed to paste from clipboard");
-  }
-  return new TextDecoder().decode(output.stdout);
-}
 
 const DEFAULT_SYSTEM =
   "Translate any user input into English, in an informal and concise way.";
@@ -136,10 +109,12 @@ async function main() {
       provider,
     );
 
+    const cleanTranslatedText = translatedText.replace(/^"/, "").replace(/"$/, "");
+
     const endTime = performance.now();
     const duration = endTime - startTime;
 
-    await copy(translatedText);
+    await copy(cleanTranslatedText);
     await notify(
       `Translation copied to clipboard. Done (${duration.toFixed(4)}ms)`,
       5000,
