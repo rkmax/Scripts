@@ -4,7 +4,8 @@ current_script_dir=$(cd "$(dirname "${(%):-%N}")" && pwd)
 gpt_script=$current_script_dir/gpt.ts
 
 gpt_request() {
-    result=$($gpt_script "$BUFFER")
+
+    result=$(cd $HOME && $gpt_script "$BUFFER")
     result_length=${#result}
 
     BUFFER="$result"

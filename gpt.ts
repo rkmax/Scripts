@@ -8,8 +8,7 @@ Your task is to answer the questions without any commentation at all, providing 
 You can assume that the user understands that they need to fill in placeholders like <PORT>.
 You're not allowed to explain anything and you're not a chatbot.
 You only provide shell commands or code.
-Keep the responses to one-liner answers as much as possible. Do not decorate the answer with tickmarks`
-    
+Keep the responses to one-liner answers as much as possible. Do not decorate the answer with tickmarks`;
 
 async function gpt(
   text: string,
@@ -46,13 +45,12 @@ async function gpt(
   return data.choices[0].message.content;
 }
 
-
 async function main() {
-    await load({export: true});
-    const apiKey = Deno.env.get("OPENAI_API_KEY") ?? "";
-    const prompt = Deno.args.join(" ");
-    const response  = await gpt(prompt, DEFAULT_SYSTEM, apiKey);
-    console.log(response);
+  await load({ export: true });
+  const apiKey = Deno.env.get("OPENAI_API_KEY") ?? "";
+  const prompt = Deno.args.join(" ");
+  const response = await gpt(prompt, DEFAULT_SYSTEM, apiKey);
+  console.log(response);
 }
 
 main();
