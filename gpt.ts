@@ -16,7 +16,11 @@ async function gpt(
   apiKey: string,
 ): Promise<string> {
   if (!apiKey) {
-    console.error("OPENAI_API_KEY must be set in your environment");
+    Deno.stderr.write(
+      new TextEncoder().encode(
+        "Error: OPENAI_API_KEY environment variable is not set.\n",
+      ),
+    );
     Deno.exit(1);
   }
 
@@ -24,7 +28,7 @@ async function gpt(
 
   const headers = {
     "Content-Type": "application/json",
-    "Authorization": `Bearer ${apiKey}`,
+    Authorization: `Bearer ${apiKey}`,
   };
 
   const body = JSON.stringify({
@@ -50,7 +54,7 @@ async function main() {
   const apiKey = Deno.env.get("OPENAI_API_KEY") ?? "";
   const prompt = Deno.args.join(" ");
   const response = await gpt(prompt, DEFAULT_SYSTEM, apiKey);
-  console.log(response);
+  Deno.stdout.write(new TextEncoder().encode(response));
 }
 
 main();

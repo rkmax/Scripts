@@ -1,0 +1,4 @@
+#!/bin/bash
+# Invoca gsutil con el Python de pyenv
+
+gsutil "$@"

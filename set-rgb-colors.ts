@@ -61,11 +61,13 @@ async function getMostSaturatedImageColor(image: string) {
     ];
     let selectedColorName = "primary";
 
+    // saturation comparison
     colorsToInspect.forEach((colorName) => {
         if (hsl[colorName][1] > hsl[selectedColorName][1]) {
             selectedColorName = colorName;
         }
     });
+
     console.log(`Selected color: ${selectedColorName}`);
 
     return rgb[selectedColorName];

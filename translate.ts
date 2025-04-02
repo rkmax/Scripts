@@ -1,7 +1,7 @@
 #!/usr/bin/env -S deno run --allow-net --allow-env --allow-run --allow-read --allow-write
 
 import { load } from "https://deno.land/std@0.224.0/dotenv/mod.ts";
-import { copy, paste } from "./encode-json.ts";
+import { copy, paste } from "./wl-clipboard.ts";
 
 type TranslationProvider = "openai" | "ollama";
 
@@ -109,7 +109,10 @@ async function main() {
       provider,
     );
 
-    const cleanTranslatedText = translatedText.replace(/^"/, "").replace(/"$/, "");
+    const cleanTranslatedText = translatedText.replace(/^"/, "").replace(
+      /"$/,
+      "",
+    );
 
     const endTime = performance.now();
     const duration = endTime - startTime;

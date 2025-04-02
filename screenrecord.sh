@@ -37,7 +37,7 @@ function start_recording() {
 
   echo "Recording video to $filepath."
 
-  wf-recorder -g "$selection" -f "$filepath" &
+  wf-recorder -g "$selection" -f "$filepath" --codec libx264rgb --pixel-format bgr24 &
   local pid=$!
 
   echo "Recording started with PID: $pid."
@@ -52,9 +52,9 @@ function start_recording() {
     if $copy_to_clipboard; then
       if [ -x "$(command -v wl-copy)" ]; then
         wl-copy < "$filepath"
-        echo "Recording copied to clipboard."
+        echo "Recording filepath copied to clipboard."
         if [ -x "$(command -v notify-send)" ]; then
-          notify-send -r "344522" "Recording copied to clipboard" "$filepath"
+          notify-send -r "344522" "Recording filepath copied to clipboard" "$filepath"
         fi
       else
         echo "wl-copy is not installed. Install it with 'sudo pacman -S wl-clipboard'."
