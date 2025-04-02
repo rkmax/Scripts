@@ -1,6 +1,8 @@
 #!/usr/bin/env -S deno run --allow-net --allow-env --allow-run --allow-read --allow-write
 
-import { load } from "https://deno.land/std@0.224.0/dotenv/mod.ts";
+import { load } from "jsr:@std/dotenv";
+import { join } from "jsr:@std/path";
+import { DatabaseSync } from "node:sqlite";
 
 const DEFAULT_MODEL = "gpt-4o-mini";
 const DEFAULT_SYSTEM = `You're an in-line zsh assistant running on archlinux.
@@ -10,20 +12,28 @@ You're not allowed to explain anything and you're not a chatbot.
 You only provide shell commands or code.
 Keep the responses to one-liner answers as much as possible. Do not decorate the answer with tickmarks`;
 
-async function gpt(
-  text: string,
-  systemPrompt: string,
-  apiKey: string,
-): Promise<string> {
-  if (!apiKey) {
-    Deno.stderr.write(
-      new TextEncoder().encode(
-        "Error: OPENAI_API_KEY environment variable is not set.\n",
-      ),
-    );
-    Deno.exit(1);
-  }
+function initializeDB(db: DatabaseSync) {
+  db.exec(`CREATE TABLE IF NOT EXISTS requests (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    prompt TEXT NOT NULL,
+    response TEXT NOT NULL,
+    timestamp DATETIME DEFAULT CURRENT_TIMESTAMP
+  )`);
+}
 
+function saveToDB(db: DatabaseSync, prompt: string, response: string) {
+  db.prepare("INSERT INTO requests (prompt, response) VALUES (?, ?)").run(
+    prompt,
+    response,
+  );
+}
+
+async function fetchResponse(
+  apiKey: string,
+  prompt: string,
+  systemPrompt: string,
+  db: DatabaseSync,
+): Promise<string> {
   const url = "https://api.openai.com/v1/chat/completions";
 
   const headers = {
@@ -35,7 +45,7 @@ async function gpt(
     model: DEFAULT_MODEL,
     messages: [
       { role: "system", content: systemPrompt },
-      { role: "user", content: text },
+      { role: "user", content: prompt },
     ],
   });
 
@@ -46,15 +56,33 @@ async function gpt(
   });
 
   const data = await response.json();
-  return data.choices[0].message.content;
+  const content = data.choices[0].message.content;
+
+  saveToDB(db, prompt, content);
+
+  return content;
 }
 
 async function main() {
   await load({ export: true });
-  const apiKey = Deno.env.get("OPENAI_API_KEY") ?? "";
+  const apiKey = Deno.env.get("OPENAI_API_KEY") || "";
+  const defaultDbPath = join(Deno.env.get("HOME") || "", ".gpt_requests.db");
+  const dbPath = Deno.env.get("GPT_DB_PATH") || defaultDbPath;
   const prompt = Deno.args.join(" ");
-  const response = await gpt(prompt, DEFAULT_SYSTEM, apiKey);
-  Deno.stdout.write(new TextEncoder().encode(response));
+
+  if (!apiKey) {
+    throw new Error("OPENAI_API_KEY environment variable is not set.");
+  }
+
+  const db = new DatabaseSync(dbPath);
+  initializeDB(db);
+
+  try {
+    const response = await fetchResponse(apiKey, prompt, DEFAULT_SYSTEM, db);
+    Deno.stdout.write(new TextEncoder().encode(response));
+  } finally {
+    db.close();
+  }
 }
 
-main();
+await main();
