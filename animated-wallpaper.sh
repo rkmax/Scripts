@@ -4,6 +4,7 @@
 PLAYLIST_PATH="/home/rkmax/Videos/Backgrounds/playlist.m3u"
 MPVPAPER_OPTS="-o 'no-audio --loop-playlist'"
 DISPLAY_TARGET="*"
+LOG_FILE="/home/rkmax/Development/Scripts/mpvpaper.log"
 
 # Error codes
 readonly E_ALREADY_RUNNING=1
@@ -30,7 +31,29 @@ stop_mpvpaper() {
     fi
 }
 
-# Function to start mpvpaper
+# Function to check the status of mpvpaper
+check_status() {
+    if pgrep -x "mpvpaper" > /dev/null; then
+        echo "mpvpaper is running."
+        return 0
+    else
+        echo "mpvpaper is not running."
+        return 1
+    fi
+}
+
+# Function to monitor and restart mpvpaper if it dies
+monitor_mpvpaper() {
+    while true; do
+        if ! pgrep -x "mpvpaper" > /dev/null; then
+            echo "$(date): mpvpaper stopped. Restarting..." >> "$LOG_FILE"
+            nohup mpvpaper $MPVPAPER_OPTS "$DISPLAY_TARGET" "$PLAYLIST_PATH" >> "$LOG_FILE" 2>&1 &
+        fi
+        sleep 5
+    done
+}
+
+# Function to start mpvpaper with monitoring
 start_mpvpaper() {
     # Check if playlist exists
     if [[ ! -f "$PLAYLIST_PATH" ]]; then
@@ -44,9 +67,10 @@ start_mpvpaper() {
         exit $E_ALREADY_RUNNING
     fi
 
-    # Start mpvpaper in the background
-    nohup mpvpaper $MPVPAPER_OPTS "$DISPLAY_TARGET" "$PLAYLIST_PATH" > /dev/null 2>&1 &
-    echo "mpvpaper started as a daemon."
+    # Start mpvpaper with monitoring in the background
+    echo "$(date): Starting mpvpaper..." >> "$LOG_FILE"
+    nohup bash /home/rkmax/Development/Scripts/monitor-mpvpaper.sh >> "$LOG_FILE" 2>&1 &
+    echo "mpvpaper started with monitoring."
 }
 
 # Show usage
@@ -56,8 +80,9 @@ Usage: $(basename "$0") [OPTION]
 Set animated wallpaper using mpvpaper.
 
 Options:
-  -h, --help    Show this help message
-  -s, --stop    Stop running mpvpaper instance
+  -h, --help      Show this help message
+  -s, --stop      Stop running mpvpaper instance
+  -t, --status    Check if mpvpaper is running
 EOF
 }
 
@@ -72,6 +97,10 @@ main() {
             ;;
         -s|--stop)
             stop_mpvpaper
+            exit 0
+            ;;
+        -t|--status)
+            check_status
             exit 0
             ;;
         "")

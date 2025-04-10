@@ -37,7 +37,7 @@ function start_recording() {
 
   echo "Recording video to $filepath."
 
-  wf-recorder -g "$selection" -f "$filepath" --codec libx264rgb --pixel-format bgr24 &
+  wf-recorder -g "$selection" -f "$filepath" --codec libx264 &
   local pid=$!
 
   echo "Recording started with PID: $pid."
