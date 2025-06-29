@@ -5,9 +5,10 @@ gpt_script=$current_script_dir/gpt.ts
 history_script=$current_script_dir/gpt-db.ts
 
 gpt_request() {
-
+    export DENO_NO_UPDATE_CHECK=1
     result=$(cd $HOME && $gpt_script "$BUFFER")
     result_length=${#result}
+    unset DENO_NO_UPDATE_CHECK
 
     BUFFER="$result"
     CURSOR=$result_length
