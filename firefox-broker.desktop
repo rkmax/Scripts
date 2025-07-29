@@ -1,0 +1,27 @@
+[Desktop Entry]
+Version=1.1
+Type=Application
+Name=Firefox Broker
+GenericName=Intelligent Web Browser Router
+Comment=Routes links to most recently active Firefox profile
+Icon=firefox
+Exec=firefox-broker %u
+Actions=new-window;new-private-window;profile-manager;
+MimeType=text/html;text/xml;application/xhtml+xml;application/xml;application/rss+xml;application/rdf+xml;image/gif;image/jpeg;image/png;x-scheme-handler/http;x-scheme-handler/https;x-scheme-handler/ftp;x-scheme-handler/chrome;video/webm;application/x-xpinstall;
+StartupNotify=false
+Categories=Network;WebBrowser;
+Keywords=Internet;WWW;Browser;Web;Explorer;Firefox;Profile;Broker;
+StartupWMClass=firefox
+NoDisplay=false
+
+[Desktop Action new-window]
+Name=Open a New Window
+Exec=firefox-broker --new-window
+
+[Desktop Action new-private-window]
+Name=Open a New Private Window
+Exec=firefox-broker --private-window
+
+[Desktop Action profile-manager]
+Name=Open Profile Manager
+Exec=firefox --ProfileManager

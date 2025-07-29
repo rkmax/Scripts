@@ -1,0 +1,208 @@
+#!/bin/bash
+# firefox-broker - Routes external links to most recently active Firefox profile
+# Solves Firefox's limitation of always opening links in default profile
+# See: https://support.mozilla.org/en-US/questions/999493
+
+set -euo pipefail
+
+readonly DEBUG="${FIREFOX_BROKER_DEBUG:-1}"  # Default DEBUG=1 for xdg-open compatibility
+readonly SILENT="${FIREFOX_BROKER_SILENT:-0}"
+readonly CACHE_FILE="/tmp/.firefox-broker-cache-$$"
+trap 'rm -f "$CACHE_FILE"' EXIT
+
+log_debug() { [[ "$DEBUG" == "1" ]] && echo "[DEBUG] $*" >&2; }
+log_error() { [[ "$SILENT" != "1" ]] && echo "[ERROR] $*" >&2; }
+log_info() { [[ "$DEBUG" == "1" ]] && echo "[INFO] $*" >&2; }
+
+check_dependencies() {
+    local missing=()
+    for dep in hyprctl jq firefox; do
+        command -v "$dep" >/dev/null || missing+=("$dep")
+    done
+    [[ ${#missing[@]} -gt 0 ]] && { log_error "Missing: ${missing[*]}"; exit 1; }
+}
+
+get_firefox_windows() {
+    local force_refresh="${1:-false}"
+    if [[ "$force_refresh" != "true" && -f "$CACHE_FILE" && $(($(date +%s) - $(stat -c %Y "$CACHE_FILE" 2>/dev/null || echo 999))) -lt 2 ]]; then
+        log_debug "Using cached window info"
+        cat "$CACHE_FILE"
+        return
+    fi
+    log_debug "Fetching window info from hyprctl"
+    timeout 10 hyprctl clients -j 2>/dev/null | \
+        jq -r '.[] | select(.class == "firefox") | "\(.pid):\(.focusHistoryID):\(.address):\(.title)"' > "$CACHE_FILE" || {
+        log_error "Failed to get window info"; return 1; }
+    cat "$CACHE_FILE"
+}
+
+detect_profile_for_pid() {
+    local pid="$1" profile="default" cmdline
+    log_debug "Detecting profile for PID: $pid"
+    [[ ! -d "/proc/$pid" ]] && { echo "$profile"; return; }
+    cmdline=$(tr '\0' ' ' < "/proc/$pid/cmdline" 2>/dev/null) || { echo "$profile"; return; }
+    log_debug "Command line for PID $pid: $cmdline"
+    if [[ $cmdline =~ -P[[:space:]]+([^[:space:]]+) ]]; then
+        profile="${BASH_REMATCH[1]}"
+        log_debug "Found profile: $profile"
+    elif [[ $cmdline =~ --profile[[:space:]]+([^[:space:]]+) ]] && [[ ${BASH_REMATCH[1]} =~ /([^/]+)$ ]]; then
+        profile="${BASH_REMATCH[1]%.*}"
+        log_debug "Found profile path: $profile"
+    fi
+    echo "$profile"
+}
+
+find_most_recent_firefox() {
+    local windows most_recent_pid="" most_recent_focus=999999 most_recent_profile="default"
+    log_debug "Finding most recent Firefox window"
+    windows=$(get_firefox_windows true) || { echo "$most_recent_profile"; return; }
+    [[ -z "$windows" ]] && { log_debug "No Firefox windows open"; echo "$most_recent_profile"; return; }
+    while IFS=':' read -r pid focus_id address title; do
+        log_debug "Window: PID=$pid, Focus=$focus_id, Title=$title"
+        if [[ $focus_id -lt $most_recent_focus ]]; then
+            most_recent_focus=$focus_id
+            most_recent_pid=$pid
+            log_debug "New most recent: PID=$pid, Focus=$focus_id"
+        fi
+    done <<< "$windows"
+    [[ -n "$most_recent_pid" ]] && most_recent_profile=$(detect_profile_for_pid "$most_recent_pid")
+    log_info "Most recent Firefox: PID=$most_recent_pid, Profile=$most_recent_profile"
+    echo "$most_recent_profile"
+}
+
+validate_url() {
+    local url="$1"
+    [[ ! $url =~ ^(https?|file|ftp)://.*$ && ! $url =~ ^[a-zA-Z0-9.-]+\.[a-zA-Z]{2,}.*$ ]] && { log_error "Invalid URL: $url"; return 1; }
+    [[ $url =~ [\;\|\&\$\`] ]] && { log_error "Dangerous chars in URL: $url"; return 1; }
+}
+
+focus_firefox_window() {
+    local windows most_recent_address="" most_recent_focus=999999
+    windows=$(get_firefox_windows true) || return 1
+    while IFS=':' read -r pid focus_id address title; do
+        [[ $focus_id -lt $most_recent_focus ]] && { most_recent_focus=$focus_id; most_recent_address=$address; }
+    done <<< "$windows"
+    [[ -n "$most_recent_address" ]] && timeout 10 hyprctl dispatch focuswindow "address:$most_recent_address" >/dev/null 2>&1
+}
+
+# Route URL to the appropriate Firefox profile
+route_url() {
+    local url="$1"
+    local target_profile
+    local firefox_windows
+    
+    log_info "Routing URL: $url"
+    
+    # Validate URL
+    if ! validate_url "$url"; then
+        exit 1
+    fi
+    
+    # Find target profile
+    target_profile=$(find_most_recent_firefox)
+    log_info "Target profile: $target_profile"
+    
+    # Check if Firefox is running - force fresh data
+    if firefox_windows=$(get_firefox_windows true) && [[ -n "$firefox_windows" ]]; then
+        log_debug "Firefox is running, attempting to open in existing instance"
+        
+        # Try to open URL in existing Firefox instance
+        local firefox_cmd=("firefox")
+        
+        # Add profile specification if not default
+        if [[ "$target_profile" != "default" ]]; then
+            firefox_cmd+=("-P" "$target_profile")
+        fi
+        
+        # Add URL opening arguments for existing instance
+        firefox_cmd+=("--new-tab" "$url")
+        
+        log_debug "Executing: ${firefox_cmd[*]}"
+        
+        # Execute Firefox command (will send to existing instance)
+        if "${firefox_cmd[@]}" >/dev/null 2>&1; then
+            log_info "URL opened in existing Firefox instance (profile: $target_profile)"
+            
+            # Give Firefox time to process the command
+            sleep 0.3
+            focus_firefox_window
+            exit 0
+        else
+            log_debug "Failed to open in existing instance, trying alternative method"
+        fi
+        
+        # Alternative: try firefox --remote command
+        if firefox --remote "openURL($url,new-tab)" >/dev/null 2>&1; then
+            log_info "URL opened using Firefox remote command"
+            sleep 0.3
+            focus_firefox_window
+            exit 0
+        else
+            log_debug "Firefox remote command failed"
+        fi
+    else
+        log_debug "No Firefox windows found, starting new instance"
+    fi
+    
+    # Fallback: start new Firefox instance
+    local firefox_cmd=("firefox")
+    
+    # Add profile specification if not default
+    if [[ "$target_profile" != "default" ]]; then
+        firefox_cmd+=("-P" "$target_profile")
+    fi
+    
+    # Add URL as startup argument
+    firefox_cmd+=("$url")
+    
+    log_debug "Executing fallback: ${firefox_cmd[*]}"
+    
+    # Execute Firefox command in background
+    "${firefox_cmd[@]}" >/dev/null 2>&1 &
+    local firefox_pid=$!
+    
+    # Check if Firefox process started successfully
+    sleep 0.2
+    if kill -0 "$firefox_pid" 2>/dev/null; then
+        log_info "Firefox started with new instance, PID: $firefox_pid"
+        
+        # Give Firefox time to start, then focus
+        sleep 1.0
+        focus_firefox_window
+        exit 0
+    else
+        log_error "Failed to start Firefox"
+        exit 1
+    fi
+}
+
+# Display usage information
+show_usage() {
+    cat << EOF
+Usage: firefox-broker <URL>
+Routes external links to most recently active Firefox profile.
+
+Environment: FIREFOX_BROKER_DEBUG=1 (default), FIREFOX_BROKER_SILENT=1
+Requires: hyprctl, jq, firefox
+EOF
+}
+
+# Main execution
+main() {
+    # Handle help requests
+    if [[ $# -eq 0 ]] || [[ "$1" == "-h" ]] || [[ "$1" == "--help" ]]; then
+        show_usage
+        exit 0
+    fi
+    
+    # Check dependencies
+    check_dependencies
+    
+    # Route the URL
+    route_url "$1"
+}
+
+# Execute main function if script is run directly
+if [[ "${BASH_SOURCE[0]}" == "${0}" ]]; then
+    main "$@"
+fi
