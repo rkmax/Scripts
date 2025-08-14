@@ -44,19 +44,31 @@ export class EditorRofi {
     this.maxEntries = config.maxEntries ?? 15;
   }
 
+  private generateRofiOption(name: string, value: string) {
+    return `\0${name}\x1f${value}`;
+  }
+
+  private generateRofiOtions(options: string[]) {
+    if (!options || options.length === 0) {
+      return;
+    }
+
+    console.log(options.join("\n") + "\n");
+  }
+
   private generateRofiEntry(entry: RofiEntry): string {
     const parts: string[] = [];
-    
+
     if (entry.icon) {
       parts.push("icon");
       parts.push(entry.icon);
     }
-    
+
     // Replace home directory with ~ for display
     const displayName = entry.name.replace(this.homeDir, "~");
     parts.push("display");
     parts.push(displayName);
-    
+
     const line = parts.join("\x1f");
     return `${entry.name}\0${line}`;
   }
@@ -68,9 +80,9 @@ export class EditorRofi {
 
   private getIconForEntry(entry: Entry): string {
     let icon = "folder";
-    
+
     if (entry.type === "file") {
-      const ext = entry.path.split('.').pop()?.toLowerCase();
+      const ext = entry.path.split(".").pop()?.toLowerCase();
       // Use provider's getFileIcon if available, otherwise use default
       icon = this.provider.getFileIcon?.(ext) ?? this.getDefaultFileIcon(ext);
     } else if (entry.type === "ssh") {
@@ -80,7 +92,7 @@ export class EditorRofi {
     } else if (entry.type === "workspace") {
       icon = "folder-documents";
     }
-    
+
     return icon;
   }
 
@@ -106,7 +118,7 @@ export class EditorRofi {
     return entries.sort((a, b) => {
       const priorityDiff = typePriority[a.type] - typePriority[b.type];
       if (priorityDiff !== 0) return priorityDiff;
-      
+
       // Then sort by timestamp if available
       if (a.timestamp && b.timestamp) {
         return b.timestamp.localeCompare(a.timestamp);
@@ -117,27 +129,36 @@ export class EditorRofi {
 
   async formatRecentEntries(): Promise<void> {
     const entries = await this.provider.getRecentEntries();
-    
+
     if (entries.length === 0) {
       console.log("No recent entries found\n");
       return;
     }
-    
+
     // Remove duplicates and limit entries
-    const uniqueEntries = this.removeDuplicates(entries).slice(0, this.maxEntries);
-    
+    const uniqueEntries = this.removeDuplicates(entries).slice(
+      0,
+      this.maxEntries,
+    );
+
     // Sort entries using provider's sort or default
     const sortedEntries = this.provider.sortEntries
       ? this.provider.sortEntries(uniqueEntries)
       : this.defaultSortEntries(uniqueEntries);
-    
+
+    this.generateRofiOtions([
+      this.generateRofiOption("use-hot-keys", "true"),
+      this.generateRofiOption("no-custom", "true"),
+      this.generateRofiOption("markup-rows", "true"),
+    ]);
+
     // Output formatted entries for Rofi
     for (const entry of sortedEntries) {
       const icon = this.getIconForEntry(entry);
-      
+
       // Use display name for remote projects, path for local
       const displayPath = entry.displayName || entry.path;
-      
+
       const rofiEntry = this.generateRofiEntry({
         name: displayPath,
         icon: icon,
@@ -146,20 +167,21 @@ export class EditorRofi {
     }
   }
 
-  executeEditor(path: string): void {
+  executeEditor(path: string, extraArgs: string[] = []): void {
     const command = new Deno.Command(this.provider.getExecutableCommand(), {
-      args: [path],
+      args: [path, ...extraArgs],
+      stdin: "null",
       stdout: "null",
       stderr: "null",
     });
-    
+
     command.spawn();
   }
 
   async run(): Promise<void> {
     const rofiRetv = parseInt(Deno.env.get("ROFI_RETV") ?? "0");
     const args = Deno.args;
-    
+
     switch (rofiRetv) {
       case 0:
         // Initial call - display the list
@@ -171,6 +193,10 @@ export class EditorRofi {
           this.executeEditor(args[0]);
         }
         break;
+      case 10:
+        if (args.length > 0) {
+          this.executeEditor(args[0], ["-n"]);
+        }
     }
   }
 }
@@ -204,7 +230,7 @@ const FILE_ICON_MAP: Record<string, string> = {
   "fs": "text-x-fsharp",
   "fsx": "text-x-fsharp",
   "fsi": "text-x-fsharp",
-  
+
   // Programming Languages - Web
   "html": "text-html",
   "htm": "text-html",
@@ -220,7 +246,7 @@ const FILE_ICON_MAP: Record<string, string> = {
   "php5": "application-x-php",
   "php7": "application-x-php",
   "phtml": "application-x-php",
-  
+
   // Programming Languages - Systems
   "rs": "text-rust",
   "go": "text-x-go",
@@ -234,7 +260,7 @@ const FILE_ICON_MAP: Record<string, string> = {
   "kts": "text-x-kotlin",
   "m": "text-x-objcsrc",
   "mm": "text-x-objcsrc",
-  
+
   // Programming Languages - Scripting
   "rb": "application-x-ruby",
   "rbw": "application-x-ruby",
@@ -253,7 +279,7 @@ const FILE_ICON_MAP: Record<string, string> = {
   "exs": "text-x-elixir",
   "erl": "text-x-erlang",
   "hrl": "text-x-erlang",
-  
+
   // Programming Languages - Functional
   "hs": "text-x-haskell",
   "lhs": "text-x-haskell",
@@ -270,7 +296,7 @@ const FILE_ICON_MAP: Record<string, string> = {
   "scm": "text-x-scheme",
   "ss": "text-x-scheme",
   "rkt": "text-x-scheme",
-  
+
   // Programming Languages - Low Level
   "asm": "text-x-asm",
   "s": "text-x-asm",
@@ -288,7 +314,7 @@ const FILE_ICON_MAP: Record<string, string> = {
   "ads": "text-x-adasrc",
   "cob": "text-x-cobol",
   "cbl": "text-x-cobol",
-  
+
   // Shell & Scripts
   "sh": "text-x-script",
   "bash": "text-x-script",
@@ -303,7 +329,7 @@ const FILE_ICON_MAP: Record<string, string> = {
   "cmd": "text-x-script",
   "awk": "text-x-script",
   "sed": "text-x-script",
-  
+
   // Markup & Data
   "xml": "text-xml",
   "xsl": "text-xml",
@@ -324,7 +350,7 @@ const FILE_ICON_MAP: Record<string, string> = {
   "props": "text-x-generic",
   "env": "text-x-generic",
   "dotenv": "text-x-generic",
-  
+
   // Documentation
   "md": "text-x-markdown",
   "markdown": "text-x-markdown",
@@ -345,7 +371,7 @@ const FILE_ICON_MAP: Record<string, string> = {
   "readme": "text-x-readme",
   "todo": "text-x-generic",
   "nfo": "text-x-nfo",
-  
+
   // Build & Config
   "makefile": "text-x-makefile",
   "mk": "text-x-makefile",
@@ -361,7 +387,7 @@ const FILE_ICON_MAP: Record<string, string> = {
   "gulpfile": "application-x-javascript",
   "gruntfile": "application-x-javascript",
   "webpack.config.js": "application-x-javascript",
-  
+
   // Database
   "sql": "text-x-sql",
   "mysql": "text-x-sql",
@@ -369,12 +395,12 @@ const FILE_ICON_MAP: Record<string, string> = {
   "sqlite": "text-x-sql",
   "db": "application-vnd.oasis.opendocument.database",
   "sqlite3": "application-vnd.oasis.opendocument.database",
-  
+
   // Data Files
   "csv": "text-csv",
   "tsv": "text-csv",
   "ldif": "text-x-ldif",
-  
+
   // LaTeX & Typography
   "tex": "text-x-tex",
   "ltx": "text-x-tex",
@@ -384,11 +410,11 @@ const FILE_ICON_MAP: Record<string, string> = {
   "sty": "text-x-tex",
   "cls": "text-x-tex",
   "typst": "text-x-typst",
-  
+
   // Web Assembly
   "wat": "text-plain",
   "wasm": "application-wasm",
-  
+
   // Template Files
   "tpl": "text-plain",
   "hbs": "text-html",
@@ -402,7 +428,7 @@ const FILE_ICON_MAP: Record<string, string> = {
   "twig": "text-html",
   "vue": "text-html",
   "svelte": "text-html",
-  
+
   // Version Control
   "gitignore": "text-x-generic",
   "gitattributes": "text-x-generic",
@@ -410,22 +436,22 @@ const FILE_ICON_MAP: Record<string, string> = {
   "gitconfig": "text-x-generic",
   "hgignore": "text-x-generic",
   "svnignore": "text-x-generic",
-  
+
   // Patches & Diffs
   "patch": "text-x-patch",
   "diff": "text-x-patch",
   "rej": "text-x-patch",
-  
+
   // Localization
   "po": "text-x-po",
   "pot": "text-x-po",
   "mo": "text-x-po",
-  
+
   // QML & Qt
   "qml": "text-x-qml",
   "qrc": "text-xml",
   "ui": "text-xml",
-  
+
   // Other
   "vim": "text-plain",
   "vimrc": "text-plain",
