@@ -224,7 +224,14 @@ export class EditorRofi {
     // Use provider options if available, otherwise use defaults
     const rofiOptions = this.provider.getRofiOptions?.() ??
       this.DEFAULT_ROFI_OPTIONS;
-    const formattedOptions = rofiOptions.map((opt) =>
+
+    // Add prompt option with provider name
+    const optionsWithPrompt = [
+      ...rofiOptions,
+      { name: "message", value: `Open with ${this.provider.name}` },
+    ];
+
+    const formattedOptions = optionsWithPrompt.map((opt) =>
       this.generateRofiOption(opt.name, opt.value)
     );
     this.generateRofiOptions(formattedOptions);
