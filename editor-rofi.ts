@@ -1,6 +1,57 @@
 #!/usr/bin/env -S deno run --allow-net --allow-env --allow-run --allow-read --allow-write
 
+/**
+ * EditorRofi - A Rofi integration framework for text editors
+ *
+ * This module provides a generic interface to display recent files/projects
+ * from various text editors in Rofi launcher.
+ *
+ * ## Usage with Rofi:
+ *
+ * To use this with Rofi, you need to call it as a custom mode:
+ * ```bash
+ * rofi -show {editor_name} -modes "{editor_name}:/path/to/{editor}-rofi.ts" \
+ *      -show-icons \
+ *      -kb-custom-1 "Shift+Return" \
+ *      -kb-accept-alt ""
+ * ```
+ *
+ * Where:
+ * - {editor_name}: The name shown in Rofi (e.g., "vscode", "zed")
+ * - {editor}-rofi.ts: Your specific editor implementation (vscode-rofi.ts, zed-rofi.ts)
+ * - -show-icons: Enables icon display for files and folders
+ * - -kb-custom-1: Binds Shift+Return to ROFI_RETV=10 (new window mode)
+ * - -kb-accept-alt: Unbinds the default Alt+Enter to avoid conflicts
+ *
+ * ## Examples:
+ *
+ * VSCode:
+ * ```bash
+ * rofi -show vscode -modes "vscode:$HOME/Development/Scripts/vscode-rofi.ts" \
+ *      -show-icons -kb-custom-1 "Shift+Return" -kb-accept-alt ""
+ * ```
+ *
+ * Zed:
+ * ```bash
+ * rofi -show zed -modes "zed:$HOME/Development/Scripts/zed-rofi.ts" \
+ *      -show-icons -kb-custom-1 "Shift+Return" -kb-accept-alt ""
+ * ```
+ *
+ * ## Custom Keybindings:
+ * - Enter: Open in default mode (ROFI_RETV=1)
+ * - Shift+Return: Open in new window (ROFI_RETV=10)
+ * - Additional custom keys can be mapped to ROFI_RETV 11-19
+ */
+
 export type EntryType = "folder" | "file" | "ssh" | "devserver" | "workspace";
+
+export enum EditorLaunchMode {
+  DEFAULT = "default",
+  NEW_WINDOW = "new_window",
+  NEW_TAB = "new_tab",
+  REUSE_WINDOW = "reuse_window",
+  SPLIT = "split",
+}
 
 export interface Entry {
   type: EntryType;
@@ -19,12 +70,26 @@ export interface RofiEntry {
   markupRows?: boolean;
 }
 
+export interface RofiOption {
+  name: string;
+  value: string;
+}
+
+export interface EditorLaunchConfig {
+  command?: string;
+  args?: string[];
+  prependArgs?: string[];
+  appendArgs?: string[];
+}
+
 export interface EditorProvider {
   name: string;
   getRecentEntries(): Promise<Entry[]> | Entry[];
   getExecutableCommand(): string;
   getFileIcon?(extension?: string): string;
   sortEntries?(entries: Entry[]): Entry[];
+  getRofiOptions?(): RofiOption[];
+  getLaunchConfig?(mode: EditorLaunchMode): EditorLaunchConfig | undefined;
 }
 
 export interface EditorRofiConfig {
@@ -33,10 +98,20 @@ export interface EditorRofiConfig {
   maxEntries?: number;
 }
 
+/**
+ * Main class for Rofi integration with text editors.
+ * Handles the communication between Rofi and the editor provider.
+ */
 export class EditorRofi {
   private provider: EditorProvider;
   private homeDir: string;
   private maxEntries: number;
+
+  private readonly DEFAULT_ROFI_OPTIONS: RofiOption[] = [
+    { name: "use-hot-keys", value: "true" },
+    { name: "no-custom", value: "true" },
+    { name: "markup-rows", value: "true" },
+  ];
 
   constructor(config: EditorRofiConfig) {
     this.provider = config.provider;
@@ -48,7 +123,7 @@ export class EditorRofi {
     return `\0${name}\x1f${value}`;
   }
 
-  private generateRofiOtions(options: string[]) {
+  private generateRofiOptions(options: string[]) {
     if (!options || options.length === 0) {
       return;
     }
@@ -146,11 +221,13 @@ export class EditorRofi {
       ? this.provider.sortEntries(uniqueEntries)
       : this.defaultSortEntries(uniqueEntries);
 
-    this.generateRofiOtions([
-      this.generateRofiOption("use-hot-keys", "true"),
-      this.generateRofiOption("no-custom", "true"),
-      this.generateRofiOption("markup-rows", "true"),
-    ]);
+    // Use provider options if available, otherwise use defaults
+    const rofiOptions = this.provider.getRofiOptions?.() ??
+      this.DEFAULT_ROFI_OPTIONS;
+    const formattedOptions = rofiOptions.map((opt) =>
+      this.generateRofiOption(opt.name, opt.value)
+    );
+    this.generateRofiOptions(formattedOptions);
 
     // Output formatted entries for Rofi
     for (const entry of sortedEntries) {
@@ -167,9 +244,53 @@ export class EditorRofi {
     }
   }
 
-  executeEditor(path: string, extraArgs: string[] = []): void {
-    const command = new Deno.Command(this.provider.getExecutableCommand(), {
-      args: [path, ...extraArgs],
+  executeEditor(
+    path: string,
+    mode: EditorLaunchMode = EditorLaunchMode.DEFAULT,
+  ): void {
+    // Try to get launch config for the specific mode
+    const launchConfig = this.provider.getLaunchConfig?.(mode);
+
+    let executable = this.provider.getExecutableCommand();
+    let args: string[] = [];
+
+    if (launchConfig) {
+      // Use custom configuration if provided
+      executable = launchConfig.command ?? executable;
+
+      // Build args: prependArgs + path + args + appendArgs
+      if (launchConfig.prependArgs) {
+        args.push(...launchConfig.prependArgs);
+      }
+      args.push(path);
+      if (launchConfig.args) {
+        args.push(...launchConfig.args);
+      }
+      if (launchConfig.appendArgs) {
+        args.push(...launchConfig.appendArgs);
+      }
+    } else {
+      // Fallback to default behavior with common editor flags
+      args = [path];
+
+      // Apply common editor flags based on mode
+      // These are common across many editors but may not work for all
+      switch (mode) {
+        case EditorLaunchMode.NEW_WINDOW:
+          // Common flags: -n (VS Code, Sublime), --new-window (Atom), etc.
+          args.unshift("-n");
+          break;
+        case EditorLaunchMode.REUSE_WINDOW:
+          // Common flags: -r (VS Code), --reuse-window
+          args.unshift("-r");
+          break;
+          // NEW_TAB and SPLIT typically require editor-specific handling
+          // so we don't add flags here unless the provider implements getLaunchConfig
+      }
+    }
+
+    const command = new Deno.Command(executable, {
+      args,
       stdin: "null",
       stdout: "null",
       stderr: "null",
@@ -178,7 +299,69 @@ export class EditorRofi {
     command.spawn();
   }
 
+  /**
+   * Generates the Rofi launch command for this editor.
+   * This is a helper method to avoid having to remember the complex syntax.
+   *
+   * @param scriptPath - Full path to the editor-specific script (e.g., /path/to/vscode-rofi.ts)
+   * @param modeName - The name to show in Rofi (defaults to provider name)
+   * @param additionalArgs - Any additional Rofi arguments
+   * @returns The complete Rofi command to execute
+   */
+  static generateRofiCommand(
+    scriptPath: string,
+    modeName?: string,
+    additionalArgs: string[] = [],
+  ): string {
+    const name = modeName ??
+      scriptPath.split("/").pop()?.replace("-rofi.ts", "") ?? "editor";
+
+    const baseArgs = [
+      "rofi",
+      "-show",
+      name,
+      "-modes",
+      `"${name}:${scriptPath}"`,
+      "-show-icons",
+      "-kb-custom-1",
+      `"Shift+Return"`,
+      "-kb-accept-alt",
+      `""`,
+    ];
+
+    // Add any additional custom keybindings
+    // kb-custom-2 through kb-custom-10 map to ROFI_RETV 11-19
+
+    return [...baseArgs, ...additionalArgs].join(" ");
+  }
+
+  /**
+   * Prints help information including the Rofi launch command.
+   * Called when --help flag is detected.
+   */
+  private printHelp(): void {
+    // Get the script path from the call stack
+    const scriptPath = Deno.mainModule
+      ? new URL(Deno.mainModule).pathname
+      : "editor-rofi.ts";
+    const modeName = this.provider.name.toLowerCase();
+    console.log(`${this.provider.name} Rofi Integration\n`);
+    console.log("Usage:");
+    console.log(`  ${scriptPath} [--help]`);
+    console.log("\nLaunch with Rofi:");
+    console.log(EditorRofi.generateRofiCommand(scriptPath, modeName));
+    console.log("\nKeybindings:");
+    console.log("  Enter         - Open (folders always open in new window)");
+    console.log("  Shift+Return  - Force new window (for files)");
+  }
+
   async run(): Promise<void> {
+    // Check for help flag first
+    if (Deno.args.includes("--help") || Deno.args.includes("-h")) {
+      this.printHelp();
+      Deno.exit(0);
+    }
+
     const rofiRetv = parseInt(Deno.env.get("ROFI_RETV") ?? "0");
     const args = Deno.args;
 
@@ -188,15 +371,21 @@ export class EditorRofi {
         await this.formatRecentEntries();
         break;
       case 1:
-        // User selected an entry - open in editor
+        // User selected an entry - open in editor (default mode)
         if (args.length > 0) {
-          this.executeEditor(args[0]);
+          this.executeEditor(args[0], EditorLaunchMode.DEFAULT);
         }
         break;
       case 10:
+        // Custom keybind 1 (Shift+Return) - open in new window
         if (args.length > 0) {
-          this.executeEditor(args[0], ["-n"]);
+          this.executeEditor(args[0], EditorLaunchMode.NEW_WINDOW);
         }
+        break;
+        // Additional custom keybindings can be handled here:
+        // case 11: // kb-custom-2
+        // case 12: // kb-custom-3
+        // ... up to case 19 (kb-custom-10)
     }
   }
 }
