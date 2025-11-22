@@ -3,10 +3,11 @@
 output_dir=~/Videos/Recordings
 
 function show_help() {
-  echo "Usage: $0 [start|stop] [--copy|-c]"
+  echo "Usage: $0 [start|stop] [--copy|-c] [--audio]"
   echo "  start        Start recording a selected screen area."
   echo "  stop         Stop the ongoing recording."
   echo "  --copy, -c   Copy the recording file to the clipboard (only with 'start')."
+  echo "  --audio      Record audio using PipeWire device output.filter-chain-975-30 (only with 'start')."
   exit 0
 }
 
@@ -16,10 +17,13 @@ function start_recording() {
   local filename=$(date +"%Y-%m-%d_%H-%M-%S_recording.mp4")
   local filepath="$output_dir/$filename"
   local copy_to_clipboard=false
+  local enable_audio=false
+  local audio_device="output.filter-chain-975-30"
 
   while [[ $# -gt 0 ]]; do
     case $1 in
       --copy|-c) copy_to_clipboard=true ;;
+      --audio) enable_audio=true ;;
       *) echo "Unknown option: $1" && exit 1 ;;
     esac
     shift
@@ -37,14 +41,23 @@ function start_recording() {
 
   echo "Recording video to $filepath."
 
-  wf-recorder -g "$selection" -f "$filepath" --codec libx264 &
+  local -a wf_args=(-g "$selection" -f "$filepath" --codec libx264)
+  if $enable_audio; then
+    wf_args+=("--audio=$audio_device")
+  fi
+
+  wf-recorder "${wf_args[@]}" &
   local pid=$!
+  trap "kill -SIGINT $pid 2>/dev/null" INT
+  trap "kill -SIGTERM $pid 2>/dev/null" TERM
 
   echo "Recording started with PID: $pid."
 
   wait $pid
+  local wait_status=$?
+  trap - INT TERM
 
-  if [ $? -eq 0 ]; then
+  if [ $wait_status -eq 0 ]; then
     if [ -x "$(command -v notify-send)" ]; then
       notify-send -r "344522" "Recording saved" "$filepath"
     fi
@@ -61,6 +74,9 @@ function start_recording() {
         exit 1
       fi
     fi
+  elif [ $wait_status -gt 128 ]; then
+    echo "Recording interrupted by user."
+    exit $wait_status
   else
     echo "wf-recorder failed to record video."
     if [ -x "$(command -v notify-send)" ]; then
