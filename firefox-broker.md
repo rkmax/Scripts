@@ -12,14 +12,12 @@ Firefox Broker is a TypeScript/Deno utility that intelligently routes URLs to th
 - Automatic profile detection from process command line arguments
 - Fallback to new instance if existing Firefox can't handle the request
 - Window focus management via Hyprland compositor
-- Caching for improved performance
-- Debug logging and error handling
+- File + stderr logging with env-controlled verbosity
 
 ## Requirements
 
 - **Deno** - TypeScript runtime
 - **hyprctl** - Hyprland window manager control
-- **jq** - JSON processor  
 - **firefox** - Mozilla Firefox browser
 
 ## Installation
@@ -71,13 +69,12 @@ The broker detects Firefox profiles by examining process command lines for:
 - `--profile <path>` arguments  
 - Falls back to "default" profile if none found
 
-## Caching
+## Notes
 
-Window information is cached for 2 seconds to improve performance during rapid URL opening.
+The broker queries Hyprland directly on each invocation; no caching is used.
 
 ## Error Handling
 
-- Validates URLs for security (checks schemes and dangerous characters)
+- Validates URLs for basic sanity (scheme or domain-like)
 - Graceful fallback to new Firefox instance if existing instance fails
-- Dependency checking on startup
-- Process cleanup on exit
+- Logs to `/tmp/firefox-broker-YYYY-MM-DD.log` and stderr when debug is enabled

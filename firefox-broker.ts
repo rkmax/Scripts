@@ -6,8 +6,6 @@
  * See: https://support.mozilla.org/en-US/questions/999493
  */
 
-import { existsSync } from "https://deno.land/std@0.218.0/fs/exists.ts";
-
 // Client interface for hyprctl JSON output
 interface HyprClient {
   class: string;
@@ -17,10 +15,9 @@ interface HyprClient {
   title: string;
 }
 
-// Configuration from environment
-const DEBUG = true; // Default true for xdg-open compatibility
-const SILENT = false;
-const CACHE_FILE = `/tmp/.firefox-broker-cache-${Deno.pid}`;
+// Configuration from environment (defaults: DEBUG on, SILENT off)
+const DEBUG = (Deno.env.get("FIREFOX_BROKER_DEBUG") ?? "1") !== "0";
+const SILENT = (Deno.env.get("FIREFOX_BROKER_SILENT") ?? "0") === "1";
 const LOG_FILE = `/tmp/firefox-broker-${
   new Date().toISOString().split("T")[0]
 }.log`;
@@ -74,68 +71,20 @@ const logInfo = (...args: unknown[]): void => {
   }
 };
 
-// Cleanup on exit
-globalThis.addEventListener("unload", () => {
+async function getFirefoxWindows(): Promise<FirefoxWindow[]> {
   try {
-    if (existsSync(CACHE_FILE)) {
-      Deno.removeSync(CACHE_FILE);
-    }
-  } catch {
-    // Ignore cleanup errors
-  }
-});
-
-async function checkDependencies(): Promise<void> {
-  const missing: string[] = [];
-  const deps = ["hyprctl", "jq", "firefox"];
-
-  for (const dep of deps) {
-    try {
-      const cmd = new Deno.Command("which", { args: [dep] });
-      const result = await cmd.output();
-      if (!result.success) {
-        missing.push(dep);
-      }
-    } catch {
-      missing.push(dep);
-    }
-  }
-
-  if (missing.length > 0) {
-    logError(`Missing dependencies: ${missing.join(", ")}`);
-    Deno.exit(1);
-  }
-}
-
-async function getFirefoxWindows(
-  forceRefresh = false,
-): Promise<FirefoxWindow[]> {
-  try {
-    // Check cache if not forcing refresh
-    if (!forceRefresh && existsSync(CACHE_FILE)) {
-      const stat = await Deno.stat(CACHE_FILE);
-      const age = (Date.now() - (stat.mtime?.getTime() || 0)) / 1000;
-
-      if (age < 2) {
-        logDebug("Using cached window info");
-        const cached = await Deno.readTextFile(CACHE_FILE);
-        return JSON.parse(cached);
-      }
-    }
-
     logDebug("Fetching window info from hyprctl");
 
-    // Run hyprctl command with timeout
-    const cmd = new Deno.Command("timeout", {
-      args: ["10", "hyprctl", "clients", "-j"],
+    const cmd = new Deno.Command("hyprctl", {
+      args: ["clients", "-j"],
       stdout: "piped",
       stderr: "piped",
     });
 
     const result = await cmd.output();
-
     if (!result.success) {
-      logError("Failed to get window info from hyprctl");
+      const err = new TextDecoder().decode(result.stderr).trim();
+      logError("Failed to get window info from hyprctl", err);
       return [];
     }
 
@@ -150,10 +99,6 @@ async function getFirefoxWindows(
         address: client.address,
         title: client.title,
       }));
-
-    // Cache the results
-    await Deno.writeTextFile(CACHE_FILE, JSON.stringify(firefoxWindows));
-
     return firefoxWindows;
   } catch (error) {
     logError("Error getting Firefox windows:", error);
@@ -166,10 +111,6 @@ async function detectProfileForPid(pid: number): Promise<string> {
 
   try {
     const cmdlinePath = `/proc/${pid}/cmdline`;
-    if (!existsSync(cmdlinePath)) {
-      return "default";
-    }
-
     const cmdlineBytes = await Deno.readFile(cmdlinePath);
     const cmdline = new TextDecoder().decode(cmdlineBytes).replace(/\0/g, " ");
     logDebug(`Command line for PID ${pid}: ${cmdline}`);
@@ -202,7 +143,7 @@ async function detectProfileForPid(pid: number): Promise<string> {
 async function findMostRecentFirefox(): Promise<string> {
   logDebug("Finding most recent Firefox window");
 
-  const windows = await getFirefoxWindows(true);
+  const windows = await getFirefoxWindows();
 
   if (windows.length === 0) {
     logDebug("No Firefox windows open");
@@ -212,17 +153,14 @@ async function findMostRecentFirefox(): Promise<string> {
   let mostRecentWindow: FirefoxWindow | null = null;
   let lowestFocusId = Infinity;
 
-  for (const window of windows) {
+  for (const win of windows) {
     logDebug(
-      `Window: PID=${window.pid}, Focus=${window.focusHistoryID}, Title=${window.title}`,
+      `Window: PID=${win.pid}, Focus=${win.focusHistoryID}, Title=${win.title}`,
     );
-
-    if (window.focusHistoryID < lowestFocusId) {
-      lowestFocusId = window.focusHistoryID;
-      mostRecentWindow = window;
-      logDebug(
-        `New most recent: PID=${window.pid}, Focus=${window.focusHistoryID}`,
-      );
+    if (win.focusHistoryID < lowestFocusId) {
+      lowestFocusId = win.focusHistoryID;
+      mostRecentWindow = win;
+      logDebug(`New most recent: PID=${win.pid}, Focus=${win.focusHistoryID}`);
     }
   }
 
@@ -252,7 +190,7 @@ function validateUrl(url: string): boolean {
 
 async function focusFirefoxWindow(): Promise<void> {
   try {
-    const windows = await getFirefoxWindows(true);
+    const windows = await getFirefoxWindows();
 
     if (windows.length === 0) return;
 
@@ -267,10 +205,8 @@ async function focusFirefoxWindow(): Promise<void> {
     }
 
     if (mostRecentWindow) {
-      const cmd = new Deno.Command("timeout", {
+      const cmd = new Deno.Command("hyprctl", {
         args: [
-          "10",
-          "hyprctl",
           "dispatch",
           "focuswindow",
           `address:${mostRecentWindow.address}`,
@@ -278,7 +214,6 @@ async function focusFirefoxWindow(): Promise<void> {
         stdout: "null",
         stderr: "null",
       });
-
       await cmd.output();
     }
   } catch (error) {
@@ -317,7 +252,7 @@ async function routeUrl(url: string): Promise<void> {
   logInfo(`Target profile: ${targetProfile}`);
 
   // Check if Firefox is running
-  const firefoxWindows = await getFirefoxWindows(true);
+  const firefoxWindows = await getFirefoxWindows();
 
   if (firefoxWindows.length > 0) {
     logDebug("Firefox is running, attempting to open in existing instance");
@@ -345,17 +280,7 @@ async function routeUrl(url: string): Promise<void> {
       Deno.exit(0);
     }
 
-    logDebug("Failed to open in existing instance, trying alternative method");
-
-    // Alternative: try firefox --remote command
-    if (await runFirefoxCommand(["--remote", `openURL(${url},new-tab)`])) {
-      logInfo("URL opened using Firefox remote command");
-      await new Promise((resolve) => setTimeout(resolve, 300));
-      await focusFirefoxWindow();
-      Deno.exit(0);
-    }
-
-    logDebug("Firefox remote command failed");
+    logDebug("Failed to open in existing instance");
   } else {
     logDebug("No Firefox windows found, starting new instance");
   }
@@ -407,7 +332,7 @@ function showUsage(): void {
 Routes external links to most recently active Firefox profile.
 
 Environment: FIREFOX_BROKER_DEBUG=1 (default), FIREFOX_BROKER_SILENT=1
-Requires: hyprctl, jq, firefox`);
+Requires: hyprctl, firefox`);
 }
 
 // Main execution
@@ -423,9 +348,6 @@ async function main(): Promise<void> {
     showUsage();
     Deno.exit(0);
   }
-
-  // Check dependencies
-  await checkDependencies();
 
   // Route the URL
   await routeUrl(args[0]);
