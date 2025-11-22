@@ -58,7 +58,7 @@ class VSCodeProvider implements EditorProvider {
 
 async function main() {
   const provider = new VSCodeProvider();
-  const editorRofi = new EditorRofi({ provider });
+  const editorRofi = new EditorRofi({ provider, maxEntries: 100 });
   await editorRofi.run();
 }
 
