@@ -2,7 +2,7 @@
 """
 Minimal streaming voice assistant:
 - Captures microphone audio continuously.
-- Transcribes short chunks with Whisper (Python API, no CLI).
+- Transcribes short chunks with faster-whisper (Python API, no CLI).
 - Sends only new text through a FIFO to ydotool for typing in the focused window.
 """
 
@@ -14,11 +14,11 @@ import subprocess
 import sys
 import threading
 import time
-from typing import Optional
+from typing import Optional, Sequence
 
 import numpy as np
 import soundcard as sc
-import whisper
+from faster_whisper import WhisperModel
 
 
 def parse_args() -> argparse.Namespace:
@@ -58,6 +58,16 @@ def parse_args() -> argparse.Namespace:
         type=int,
         default=3,
         help="Minimum number of characters to send to ydotool.",
+    )
+    parser.add_argument(
+        "--device",
+        default="auto",
+        help="Device for faster-whisper (auto, cpu, cuda).",
+    )
+    parser.add_argument(
+        "--compute-type",
+        default="int8_float16",
+        help="faster-whisper compute type (e.g., int8_float16, int8, float16, float32).",
     )
     parser.add_argument(
         "--list-devices",
@@ -107,7 +117,7 @@ def transcription_worker(
     audio_q: "queue.Queue[bytes]",
     typing_q: "queue.Queue[str]",
     stop_event: threading.Event,
-    model: whisper.Whisper,
+    model: WhisperModel,
     sample_rate: int,
     chunk_seconds: float,
     rms_threshold: float,
@@ -135,12 +145,20 @@ def transcription_worker(
             continue
 
         try:
-            result = model.transcribe(
-                audio_np, fp16=False, language=language, verbose=False
+            segments, _info = model.transcribe(
+                audio_np,
+                language=language,
+                beam_size=5,
+                temperature=0.0,
+                compression_ratio_threshold=2.3,
+                log_prob_threshold=-1.0,
+                no_speech_threshold=0.6,
+                vad_filter=False,
             )
-            text = result.get("text", "").strip()
+            texts: Sequence[str] = [seg.text for seg in segments]
+            text = " ".join(texts).strip()
         except Exception as exc:  # noqa: BLE001
-            print(f"[warn] Whisper failed: {exc}", file=sys.stderr)
+            print(f"[warn] Transcription failed: {exc}", file=sys.stderr)
             buffer.clear()
             continue
 
@@ -183,8 +201,36 @@ def main() -> None:
         return
     sample_rate = 16000
 
-    print(f"Loading Whisper model '{args.model}'...", file=sys.stderr)
-    model = whisper.load_model(args.model)
+    print(
+        f"Loading faster-whisper model '{args.model}' (device={args.device}, compute_type={args.compute_type})...",
+        file=sys.stderr,
+    )
+    target_device = "cuda" if args.device == "auto" else args.device
+    try:
+        model = WhisperModel(
+            args.model,
+            device=target_device,
+            compute_type=args.compute_type,
+        )
+    except Exception as exc:  # noqa: BLE001
+        if args.device != "auto":
+            raise
+        print(f"[warn] CUDA load failed ({exc}); trying CPU...", file=sys.stderr)
+        cpu_fallbacks = (args.compute_type, "int8", "float32")
+        last_exc: Exception | None = None
+        for compute_type in cpu_fallbacks:
+            try:
+                model = WhisperModel(
+                    args.model,
+                    device="cpu",
+                    compute_type=compute_type,
+                )
+                print(f"[info] Loaded on CPU with compute_type={compute_type}", file=sys.stderr)
+                break
+            except Exception as inner_exc:  # noqa: BLE001
+                last_exc = inner_exc
+        else:
+            raise last_exc if last_exc else exc
 
     audio_q: "queue.Queue[bytes]" = queue.Queue()
     typing_q: "queue.Queue[str]" = queue.Queue()
