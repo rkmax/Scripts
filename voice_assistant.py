@@ -250,7 +250,7 @@ def transcription_worker(
         silence_accum = 0.0
         speech_accum = float(len(buffer) / (bytes_per_sample * sample_rate))
 
-    if buffer and speech_accum >= min_speech_seconds:
+    if not stop_event.is_set() and buffer and speech_accum >= min_speech_seconds:
         try:
             flush_started = time.time()
             audio_np = np.frombuffer(buffer, dtype=np.int16).astype(np.float32) / 32768.0
