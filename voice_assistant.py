@@ -10,10 +10,12 @@ from __future__ import annotations
 
 import argparse
 import queue
+import re
 import subprocess
 import sys
 import threading
 import time
+import unicodedata
 from typing import Optional, Sequence
 
 import numpy as np
@@ -28,12 +30,12 @@ def parse_args() -> argparse.Namespace:
     )
     parser.add_argument(
         "--model",
-        default="base",
+        default="large",
         help="Whisper model name (tiny, base, small, medium, large, etc.).",
     )
     parser.add_argument(
         "--language",
-        default=None,
+        default="es",
         help="Optional language hint passed to Whisper (e.g., 'es').",
     )
     parser.add_argument(
@@ -44,7 +46,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument(
         "--chunk-seconds",
         type=float,
-        default=4.0,
+        default=6.0,
         help="Maximum audio duration (seconds) before forcing a transcription.",
     )
     parser.add_argument(
@@ -62,13 +64,13 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument(
         "--silence-hold",
         type=float,
-        default=0.6,
+        default=1.0,
         help="Seconds of continuous silence needed to close a segment.",
     )
     parser.add_argument(
         "--min-speech-seconds",
         type=float,
-        default=0.6,
+        default=0.8,
         help="Minimum speech duration required before transcribing a segment.",
     )
     parser.add_argument(
@@ -123,6 +125,15 @@ def delta_text(current: str, previous: str) -> str:
     if current.startswith(previous):
         return current[len(previous) :].strip()
     return current
+
+
+def clean_text(text: str) -> str:
+    text = unicodedata.normalize("NFC", text)
+    text = re.sub(r"\s+", " ", text)
+    text = re.sub(r"\.{3,}", ". ", text)
+    text = re.sub(r"\s+([,.;:!?])", r"\1", text)
+    text = re.sub(r"([,.;:!?])([^\s])", r"\1 \2", text)
+    return text.strip()
 
 
 def transcription_worker(
@@ -198,7 +209,7 @@ def transcription_worker(
                 vad_filter=False,
             )
             texts: Sequence[str] = [seg.text for seg in segments]
-            text = " ".join(texts).strip()
+            text = clean_text(" ".join(texts))
         except Exception as exc:  # noqa: BLE001
             print(f"[warn] Transcription failed: {exc}", file=sys.stderr)
             buffer.clear()
@@ -237,7 +248,7 @@ def transcription_worker(
                 vad_filter=False,
             )
             texts: Sequence[str] = [seg.text for seg in segments]
-            text = " ".join(texts).strip()
+            text = clean_text(" ".join(texts))
             if text and len(text) >= min_text_len:
                 new_text = delta_text(text, last_text)
                 if not new_text and text == last_text:
