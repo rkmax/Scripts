@@ -141,12 +141,13 @@ def transcription_worker(
     bytes_per_sample = 2  # int16
     buffer = bytearray()
     last_text = ""
-    tail_seconds = 0.4
+    tail_seconds = 0.8
+    tail_bytes_keep = int(sample_rate * tail_seconds * bytes_per_sample)
     speech_active = False
     silence_accum = 0.0
     speech_accum = 0.0
 
-    while not stop_event.is_set():
+    while not stop_event.is_set() or not audio_q.empty():
         try:
             chunk = audio_q.get(timeout=0.3)
         except queue.Empty:
@@ -167,7 +168,8 @@ def transcription_worker(
             if speech_active:
                 silence_accum += block_duration
             else:
-                buffer.clear()
+                if tail_bytes_keep > 0 and len(buffer) > tail_bytes_keep:
+                    buffer = bytearray(buffer[-tail_bytes_keep:])
                 continue
 
         should_flush = speech_active and (
@@ -212,16 +214,40 @@ def transcription_worker(
                 typing_q.put(new_text)
                 last_text = text
 
-        tail_samples = int(sample_rate * tail_seconds)
-        tail_bytes = tail_samples * bytes_per_sample
-        if tail_bytes > 0 and len(buffer) > tail_bytes:
-            buffer = bytearray(buffer[-tail_bytes:])
+        if tail_bytes_keep > 0 and len(buffer) > tail_bytes_keep:
+            buffer = bytearray(buffer[-tail_bytes_keep:])
         else:
             buffer.clear()
 
         speech_active = False
         silence_accum = 0.0
         speech_accum = float(len(buffer) / (bytes_per_sample * sample_rate))
+
+    if buffer and speech_accum >= min_speech_seconds:
+        try:
+            audio_np = np.frombuffer(buffer, dtype=np.int16).astype(np.float32) / 32768.0
+            segments, _info = model.transcribe(
+                audio_np,
+                language=language,
+                beam_size=5,
+                temperature=0.0,
+                compression_ratio_threshold=2.3,
+                log_prob_threshold=-1.0,
+                no_speech_threshold=0.6,
+                vad_filter=False,
+            )
+            texts: Sequence[str] = [seg.text for seg in segments]
+            text = " ".join(texts).strip()
+            if text and len(text) >= min_text_len:
+                new_text = delta_text(text, last_text)
+                if not new_text and text == last_text:
+                    new_text = " "
+                if new_text:
+                    if not new_text.endswith(" "):
+                        new_text = f"{new_text} "
+                    typing_q.put(new_text)
+        except Exception as exc:  # noqa: BLE001
+            print(f"[warn] Final transcription failed: {exc}", file=sys.stderr)
 
 
 def typing_worker(
