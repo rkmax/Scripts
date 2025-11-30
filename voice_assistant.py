@@ -17,7 +17,7 @@ import time
 from typing import Optional
 
 import numpy as np
-import sounddevice as sd
+import soundcard as sc
 import whisper
 
 
@@ -38,7 +38,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument(
         "--input-device",
         default=None,
-        help="Optional sounddevice input device identifier.",
+        help="Optional microphone name/substring or index (as shown by soundcard).",
     )
     parser.add_argument(
         "--chunk-seconds",
@@ -59,6 +59,28 @@ def parse_args() -> argparse.Namespace:
         help="Minimum number of characters to send to ydotool.",
     )
     return parser.parse_args()
+
+
+def pick_microphone(device: str | None) -> sc.Microphone:
+    if device is None:
+        mic = sc.default_microphone()
+        if mic is None:
+            raise SystemExit("No default microphone available.")
+        return mic
+
+    mics = sc.all_microphones(include_loopback=True)
+    if device.isdigit():
+        idx = int(device)
+        if 0 <= idx < len(mics):
+            return mics[idx]
+        raise SystemExit(f"Input index {idx} not found. Available: 0..{len(mics) - 1}")
+
+    for mic in mics:
+        if device.lower() in mic.name.lower():
+            return mic
+
+    available = ", ".join(m.name for m in mics) or "none"
+    raise SystemExit(f"No microphone matching '{device}'. Available: {available}")
 
 
 def type_with_ydotool(text: str) -> None:
@@ -151,11 +173,6 @@ def main() -> None:
     typing_q: "queue.Queue[str]" = queue.Queue()
     stop_event = threading.Event()
 
-    def audio_callback(indata, frames, time_info, status) -> None:  # type: ignore[override]
-        if status:
-            print(f"[warn] Audio status: {status}", file=sys.stderr)
-        audio_q.put(bytes(indata))
-
     transcriber = threading.Thread(
         target=transcription_worker,
         args=(
@@ -177,23 +194,31 @@ def main() -> None:
         daemon=True,
     )
 
+    mic = pick_microphone(args.input_device)
+    block_frames = 1024
+    print(f"Using microphone: {mic.name}", file=sys.stderr)
     print("Starting audio capture. Press Ctrl+C to stop.", file=sys.stderr)
-    with sd.RawInputStream(
-        samplerate=sample_rate,
-        blocksize=0,
-        device=args.input_device,
-        channels=1,
-        dtype="int16",
-        callback=audio_callback,
-    ):
-        transcriber.start()
-        typer.start()
-        try:
-            while True:
-                time.sleep(0.5)
-        except KeyboardInterrupt:
-            print("\nStopping...", file=sys.stderr)
-            stop_event.set()
+
+    transcriber.start()
+    typer.start()
+
+    try:
+        with mic.recorder(samplerate=sample_rate, blocksize=block_frames, channels=1) as recorder:
+            while not stop_event.is_set():
+                data = recorder.record(numframes=block_frames)
+                if data.size == 0:
+                    continue
+                samples = data.astype(np.float32)
+                if samples.ndim > 1:
+                    samples = samples.mean(axis=1)
+                samples = np.clip(samples, -1.0, 1.0)
+                audio_bytes = (samples * 32768.0).astype(np.int16).tobytes()
+                audio_q.put(audio_bytes)
+                time.sleep(0.01)
+    except KeyboardInterrupt:
+        print("\nStopping...", file=sys.stderr)
+    finally:
+        stop_event.set()
 
     transcriber.join(timeout=2.0)
     typer.join(timeout=2.0)
