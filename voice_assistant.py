@@ -23,12 +23,13 @@ import whisper
 
 def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(
-        description="Stream mic audio, transcribe with Whisper, and type via ydotool."
+        description="Stream mic audio, transcribe with Whisper, and type via ydotool.",
+        formatter_class=argparse.ArgumentDefaultsHelpFormatter,
     )
     parser.add_argument(
         "--model",
         default="base",
-        help="Whisper model name (tiny, base, small, medium, large, etc.). Defaults to base.",
+        help="Whisper model name (tiny, base, small, medium, large, etc.).",
     )
     parser.add_argument(
         "--language",
