@@ -88,6 +88,11 @@ def parse_args() -> argparse.Namespace:
         action="store_true",
         help="List available input devices (including loopback) and exit.",
     )
+    parser.add_argument(
+        "--debug",
+        action="store_true",
+        help="Print debug info for each segment (duration, raw text, delta).",
+    )
     return parser.parse_args()
 
 
@@ -148,6 +153,7 @@ def transcription_worker(
     silence_hold: float,
     min_speech_seconds: float,
     max_chunk_seconds: float,
+    debug: bool,
 ) -> None:
     bytes_per_sample = 2  # int16
     buffer = bytearray()
@@ -216,12 +222,18 @@ def transcription_worker(
             continue
 
         if text and len(text) >= min_text_len:
+            duration = len(audio_np) / sample_rate
             new_text = delta_text(text, last_text)
             if not new_text and text == last_text:
                 new_text = " "
             if new_text:
                 if not new_text.endswith(" "):
                     new_text = f"{new_text} "
+                if debug:
+                    print(
+                        f"[debug] segment={duration:.2f}s raw='{text}' delta='{new_text}'",
+                        file=sys.stderr,
+                    )
                 typing_q.put(new_text)
                 last_text = text
 
@@ -250,12 +262,18 @@ def transcription_worker(
             texts: Sequence[str] = [seg.text for seg in segments]
             text = clean_text(" ".join(texts))
             if text and len(text) >= min_text_len:
+                duration = len(audio_np) / sample_rate
                 new_text = delta_text(text, last_text)
                 if not new_text and text == last_text:
                     new_text = " "
                 if new_text:
                     if not new_text.endswith(" "):
                         new_text = f"{new_text} "
+                    if debug:
+                        print(
+                            f"[debug] final_segment={duration:.2f}s raw='{text}' delta='{new_text}'",
+                            file=sys.stderr,
+                        )
                     typing_q.put(new_text)
         except Exception as exc:  # noqa: BLE001
             print(f"[warn] Final transcription failed: {exc}", file=sys.stderr)
@@ -336,6 +354,7 @@ def main() -> None:
             args.silence_hold,
             args.min_speech_seconds,
             args.chunk_seconds,
+            args.debug,
         ),
         daemon=True,
     )
