@@ -58,6 +58,11 @@ def parse_args() -> argparse.Namespace:
         default=3,
         help="Minimum number of characters to send to ydotool.",
     )
+    parser.add_argument(
+        "--list-devices",
+        action="store_true",
+        help="List available input devices (including loopback) and exit.",
+    )
     return parser.parse_args()
 
 
@@ -168,6 +173,13 @@ def typing_worker(
 
 def main() -> None:
     args = parse_args()
+    if args.list_devices:
+        default_mic = sc.default_microphone()
+        default_name = default_mic.name if default_mic else None
+        for idx, mic in enumerate(sc.all_microphones(include_loopback=True)):
+            marker = " (default)" if mic.name == default_name else ""
+            print(f"{idx}: {mic.name}{marker}")
+        return
     sample_rate = 16000
 
     print(f"Loading Whisper model '{args.model}'...", file=sys.stderr)
