@@ -140,7 +140,11 @@ def transcription_worker(
 
         if text and len(text) >= min_text_len:
             new_text = delta_text(text, last_text)
+            if not new_text and text == last_text:
+                new_text = " "
             if new_text:
+                if not new_text.endswith(" "):
+                    new_text = f"{new_text} "
                 typing_q.put(new_text)
                 last_text = text
 
