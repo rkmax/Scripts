@@ -128,6 +128,7 @@ def transcription_worker(
     target_bytes = int(sample_rate * chunk_seconds * bytes_per_sample)
     buffer = bytearray()
     last_text = ""
+    tail_seconds = 0.4
 
     while not stop_event.is_set():
         try:
@@ -172,7 +173,12 @@ def transcription_worker(
                 typing_q.put(new_text)
                 last_text = text
 
-        buffer.clear()
+        tail_samples = int(sample_rate * tail_seconds)
+        tail_bytes = tail_samples * bytes_per_sample
+        if tail_bytes > 0 and len(buffer) > tail_bytes:
+            buffer = bytearray(buffer[-tail_bytes:])
+        else:
+            buffer.clear()
 
 
 def typing_worker(
