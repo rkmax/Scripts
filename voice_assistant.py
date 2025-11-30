@@ -44,8 +44,8 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument(
         "--chunk-seconds",
         type=float,
-        default=1.5,
-        help="Audio duration (seconds) per transcription attempt.",
+        default=4.0,
+        help="Maximum audio duration (seconds) before forcing a transcription.",
     )
     parser.add_argument(
         "--rms-threshold",
@@ -58,6 +58,18 @@ def parse_args() -> argparse.Namespace:
         type=int,
         default=3,
         help="Minimum number of characters to send to ydotool.",
+    )
+    parser.add_argument(
+        "--silence-hold",
+        type=float,
+        default=0.6,
+        help="Seconds of continuous silence needed to close a segment.",
+    )
+    parser.add_argument(
+        "--min-speech-seconds",
+        type=float,
+        default=0.6,
+        help="Minimum speech duration required before transcribing a segment.",
     )
     parser.add_argument(
         "--device",
@@ -119,16 +131,20 @@ def transcription_worker(
     stop_event: threading.Event,
     model: WhisperModel,
     sample_rate: int,
-    chunk_seconds: float,
     rms_threshold: float,
     min_text_len: int,
     language: Optional[str],
+    silence_hold: float,
+    min_speech_seconds: float,
+    max_chunk_seconds: float,
 ) -> None:
     bytes_per_sample = 2  # int16
-    target_bytes = int(sample_rate * chunk_seconds * bytes_per_sample)
     buffer = bytearray()
     last_text = ""
     tail_seconds = 0.4
+    speech_active = False
+    silence_accum = 0.0
+    speech_accum = 0.0
 
     while not stop_event.is_set():
         try:
@@ -136,13 +152,36 @@ def transcription_worker(
         except queue.Empty:
             continue
         buffer.extend(chunk)
-        if len(buffer) < target_bytes:
+        if not chunk:
+            continue
+
+        block_duration = len(chunk) / (bytes_per_sample * sample_rate)
+        block_np = np.frombuffer(chunk, dtype=np.int16).astype(np.float32) / 32768.0
+        block_rms = float(np.sqrt(np.mean(np.square(block_np)))) if block_np.size else 0.0
+
+        if block_rms >= rms_threshold:
+            speech_active = True
+            speech_accum += block_duration
+            silence_accum = 0.0
+        else:
+            if speech_active:
+                silence_accum += block_duration
+            else:
+                buffer.clear()
+                continue
+
+        should_flush = speech_active and (
+            silence_accum >= silence_hold or speech_accum >= max_chunk_seconds
+        )
+        if not should_flush:
             continue
 
         audio_np = np.frombuffer(buffer, dtype=np.int16).astype(np.float32) / 32768.0
-        rms = float(np.sqrt(np.mean(np.square(audio_np)))) if audio_np.size else 0.0
-        if rms < rms_threshold:
+        if not audio_np.size or speech_accum < min_speech_seconds:
             buffer.clear()
+            speech_active = False
+            silence_accum = 0.0
+            speech_accum = 0.0
             continue
 
         try:
@@ -179,6 +218,10 @@ def transcription_worker(
             buffer = bytearray(buffer[-tail_bytes:])
         else:
             buffer.clear()
+
+        speech_active = False
+        silence_accum = 0.0
+        speech_accum = float(len(buffer) / (bytes_per_sample * sample_rate))
 
 
 def typing_worker(
@@ -250,10 +293,12 @@ def main() -> None:
             stop_event,
             model,
             sample_rate,
-            args.chunk_seconds,
             args.rms_threshold,
             args.min_text_len,
             args.language,
+            args.silence_hold,
+            args.min_speech_seconds,
+            args.chunk_seconds,
         ),
         daemon=True,
     )
