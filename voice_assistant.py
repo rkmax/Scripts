@@ -163,6 +163,7 @@ def transcription_worker(
     speech_active = False
     silence_accum = 0.0
     speech_accum = 0.0
+    flush_started: float | None = None
 
     while not stop_event.is_set() or not audio_q.empty():
         try:
@@ -194,6 +195,8 @@ def transcription_worker(
         )
         if not should_flush:
             continue
+
+        flush_started = time.time()
 
         audio_np = np.frombuffer(buffer, dtype=np.int16).astype(np.float32) / 32768.0
         if not audio_np.size or speech_accum < min_speech_seconds:
@@ -230,8 +233,9 @@ def transcription_worker(
                 if not new_text.endswith(" "):
                     new_text = f"{new_text} "
                 if debug:
+                    latency = (time.time() - flush_started) if flush_started else 0.0
                     print(
-                        f"[debug] segment={duration:.2f}s raw='{text}' delta='{new_text}'",
+                        f"[debug] segment={duration:.2f}s latency={latency:.2f}s raw='{text}' delta='{new_text}'",
                         file=sys.stderr,
                     )
                 typing_q.put(new_text)
@@ -248,6 +252,7 @@ def transcription_worker(
 
     if buffer and speech_accum >= min_speech_seconds:
         try:
+            flush_started = time.time()
             audio_np = np.frombuffer(buffer, dtype=np.int16).astype(np.float32) / 32768.0
             segments, _info = model.transcribe(
                 audio_np,
@@ -270,8 +275,9 @@ def transcription_worker(
                     if not new_text.endswith(" "):
                         new_text = f"{new_text} "
                     if debug:
+                        latency = (time.time() - flush_started) if flush_started else 0.0
                         print(
-                            f"[debug] final_segment={duration:.2f}s raw='{text}' delta='{new_text}'",
+                            f"[debug] final_segment={duration:.2f}s latency={latency:.2f}s raw='{text}' delta='{new_text}'",
                             file=sys.stderr,
                         )
                     typing_q.put(new_text)
