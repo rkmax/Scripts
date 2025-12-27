@@ -16,7 +16,7 @@ class ZedProvider implements EditorProvider {
   }
 
   getExecutableCommand(): string {
-    return "zed";
+    return "zeditor";
   }
 
   async getRecentEntries(): Promise<Entry[]> {
