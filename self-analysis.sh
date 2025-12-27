@@ -39,7 +39,12 @@ collect_data() {
   journalctl -p 3 -b || true
 }
 
-collect_data | codex exec --skip-git-repo-check - | tee "${OUTPUT_FILE}"
+collect_data > "${OUTPUT_FILE}"
+
+{
+  printf '\n\n## Codex analysis\n\n'
+  codex exec --skip-git-repo-check - < "${OUTPUT_FILE}"
+} | tee -a "${OUTPUT_FILE}"
 
 if command -v code >/dev/null 2>&1; then
   code -n "${OUTPUT_FILE}"
