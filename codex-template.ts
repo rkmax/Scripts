@@ -78,16 +78,17 @@ function extractPlaceholders(template: string): string[] {
 function buildPrompt(template: string, task: string): string {
   const placeholders = extractPlaceholders(template);
   const placeholdersSection = placeholders.length > 0
-    ? `Placeholders to fill:\n- ${placeholders.join("\n- ")}`
-    : "No placeholders detected; still fill any implicit gaps with the user input.";
+    ? `Placeholders to fill (write concise English for each):\n- ${placeholders.join("\n- ")}`
+    : "No explicit placeholders detected; still cover any implicit gaps using the user input.";
 
   return [
-    "You fill the provided template using the user input.",
-    "Rules:",
-    "- Keep the structure and headings from the template.",
-    "- Replace every placeholder with concrete content; do not leave {{...}} tokens.",
-    "- Do not add explanations or extra sections.",
-    "- Return only the completed template text.",
+    "You are an assistant that outputs a completed template in English using the user input provided below.",
+    "Strict output rules:",
+    "- Do not create a plan, checklist, or commentary.",
+    "- Keep only the structure and headings from the template; do not add new sections.",
+    "- Replace every placeholder with concrete content and remove all {{...}} tokens.",
+    "- If the input lacks details for a placeholder, make a brief, reasonable fill based on context.",
+    "- Return only the filled template text and nothing else.",
     "",
     "Template:",
     "'''",
