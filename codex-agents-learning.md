@@ -15,6 +15,12 @@ and applies updates only after a preview step.
 
 `codex-agents-learning.py`
 
+Optional dependency for progress bars:
+
+```bash
+pip install tqdm
+```
+
 ## Data layout
 
 Default processing root: `.codex-agents-learning`
@@ -41,10 +47,18 @@ Session analysis runs in parallel with `4` workers by default:
 python3 codex-agents-learning.py run --limit 10
 ```
 
+If `tqdm` is installed, the run shows progress bars during session analysis.
+
 Override parallelism:
 
 ```bash
 python3 codex-agents-learning.py run --limit 20 --workers 8
+```
+
+Disable progress bars:
+
+```bash
+python3 codex-agents-learning.py run --limit 20 --no-progress
 ```
 
 Print preview diff from latest run:
