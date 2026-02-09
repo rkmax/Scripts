@@ -34,10 +34,17 @@ List sessions with status:
 python3 codex-agents-learning.py list --limit 100
 ```
 
-Process newest pending sessions (default 10), generate preview only:
+Process newest pending sessions (default 10), generate preview only.
+Session analysis runs in parallel with `4` workers by default:
 
 ```bash
 python3 codex-agents-learning.py run --limit 10
+```
+
+Override parallelism:
+
+```bash
+python3 codex-agents-learning.py run --limit 20 --workers 8
 ```
 
 Print preview diff from latest run:
@@ -66,7 +73,7 @@ Any session containing that marker is ignored by future runs.
 2. Skip already processed sessions (tracked in state).
 3. Skip sessions containing the automation marker.
 4. Copy selected sessions into a run snapshot directory.
-5. Run `codex exec` per session to produce structured proposals.
+5. Run `codex exec` per session (parallel workers) to produce structured proposals.
 6. Mark each successfully analyzed session as processed.
 7. Consolidate and deduplicate pending proposals with another `codex exec`.
 8. Generate an `AGENTS.md` candidate and unified diff preview.
@@ -77,4 +84,3 @@ Any session containing that marker is ignored by future runs.
 - `run` does **not** modify `AGENTS.md`.
 - `apply` verifies `AGENTS.md` hash from preview creation time.
 - If AGENTS changed after preview, `apply` aborts unless `--force` is used.
-
