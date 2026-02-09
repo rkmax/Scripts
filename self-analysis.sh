@@ -46,8 +46,8 @@ collect_data > "${OUTPUT_FILE}"
   codex exec --skip-git-repo-check - < "${OUTPUT_FILE}"
 } | tee -a "${OUTPUT_FILE}"
 
-if command -v code >/dev/null 2>&1; then
-  code -n "${OUTPUT_FILE}"
+if command -v zeditor >/dev/null 2>&1; then
+  zeditor -n "${OUTPUT_FILE}"
 else
-  echo "VS Code command 'code' not found. Review the report at ${OUTPUT_FILE}." >&2
+  echo "Editor command 'zeditor' not found. Review the report at ${OUTPUT_FILE}." >&2
 fi
