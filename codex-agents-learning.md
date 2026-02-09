@@ -67,6 +67,11 @@ Print preview diff from latest run:
 python3 codex-agents-learning.py preview
 ```
 
+`preview` now prints scope metadata before the diff:
+- how many analysis records are included,
+- how many sessions/runs they come from,
+- whether newer pending records exist outside that preview.
+
 Apply candidate AGENTS from latest run:
 
 ```bash
