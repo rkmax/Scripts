@@ -17,6 +17,11 @@ from dataclasses import dataclass
 from pathlib import Path
 from typing import Any
 
+try:
+    from tqdm import tqdm
+except ImportError:
+    tqdm = None
+
 
 SCRIPT_TASK_MARKER = "[[CODEX_SESSION_AUTOPROC_V1]]"
 AUTO_SECTION_START = "<!-- codex-session-learnings:start -->"
@@ -671,6 +676,7 @@ def run_command(args: argparse.Namespace) -> int:
     agents_path = Path(args.agents_path).expanduser().resolve()
     limit = max(1, args.limit)
     workers = max(1, args.workers)
+    enable_progress = not args.no_progress
 
     processing_root.mkdir(parents=True, exist_ok=True)
     state_path = processing_root / "state.json"
@@ -713,6 +719,25 @@ def run_command(args: argparse.Namespace) -> int:
     run_manifest["effective_workers"] = worker_count
     future_to_prepared: dict[Any, PreparedSession] = {}
     model = args.model or None
+    progress = None
+    if enable_progress and tqdm is not None:
+        progress = tqdm(
+            total=len(prepared_sessions),
+            desc="Analyzing sessions",
+            unit="session",
+            dynamic_ncols=True,
+        )
+    elif enable_progress and tqdm is None:
+        print(
+            "Progress bar disabled because 'tqdm' is not installed. "
+            "Install it with: pip install tqdm",
+            file=sys.stderr,
+        )
+
+    completed_count = 0
+    ok_count = 0
+    no_content_count = 0
+    failed_count = 0
     with ThreadPoolExecutor(max_workers=worker_count) as executor:
         for prepared in prepared_sessions:
             future = executor.submit(
@@ -745,6 +770,7 @@ def run_command(args: argparse.Namespace) -> int:
                 )
 
             if result.status == "failed":
+                failed_count += 1
                 run_manifest["failed_sessions"].append(result.relpath)
                 failed = failed_sessions.get(result.relpath, {"count": 0})
                 failed["count"] = int(failed.get("count", 0)) + 1
@@ -752,8 +778,16 @@ def run_command(args: argparse.Namespace) -> int:
                 failed["last_failed_at"] = utc_now()
                 failed_sessions[result.relpath] = failed
                 save_state(state_path, state)
+                completed_count += 1
+                if progress is not None:
+                    progress.update(1)
+                    progress.set_postfix(ok=ok_count, no_content=no_content_count, failed=failed_count)
                 continue
 
+            if result.status == "ok":
+                ok_count += 1
+            elif result.status == "no-content":
+                no_content_count += 1
             processed_sessions[result.relpath] = {
                 "processed_at": utc_now(),
                 "sha256": result.sha256,
@@ -774,6 +808,13 @@ def run_command(args: argparse.Namespace) -> int:
                 merge_backlog.append(record_id)
             run_manifest["processed_sessions"].append(result.relpath)
             save_state(state_path, state)
+            completed_count += 1
+            if progress is not None:
+                progress.update(1)
+                progress.set_postfix(ok=ok_count, no_content=no_content_count, failed=failed_count)
+
+    if progress is not None:
+        progress.close()
 
     save_state(state_path, state)
 
@@ -899,6 +940,11 @@ def run_command(args: argparse.Namespace) -> int:
     print(f"Run id: {run_id}")
     print(f"Selected sessions: {len(prepared_sessions)}")
     print(f"Workers: {worker_count}")
+    print(
+        "Session outcomes: "
+        f"ok={ok_count}, no-content={no_content_count}, failed={failed_count}, "
+        f"total={completed_count}"
+    )
     print(f"Processed sessions: {len(run_manifest['processed_sessions'])}")
     print(f"Failed sessions: {len(run_manifest['failed_sessions'])}")
     print(f"Preview diff: {diff_path}")
@@ -1071,6 +1117,11 @@ def build_parser() -> argparse.ArgumentParser:
             "Parallel session analyses during run "
             f"(default: {DEFAULT_WORKERS})."
         ),
+    )
+    run_parser.add_argument(
+        "--no-progress",
+        action="store_true",
+        help="Disable progress bars during session analysis.",
     )
     run_parser.add_argument(
         "--print-preview",
