@@ -1,4 +1,4 @@
-#!/usr/bin/env python3
+#!/home/rkmax/Development/Scripts/.venv_codex_agents_learning/bin/python
 
 from __future__ import annotations
 
@@ -212,6 +212,62 @@ def save_state(path: Path, state: dict[str, Any]) -> None:
     state["schema_version"] = STATE_SCHEMA_VERSION
     state["script_task_marker"] = SCRIPT_TASK_MARKER
     write_text(path, json.dumps(state, indent=2, ensure_ascii=False) + "\n")
+
+
+def split_record_id(record_id: str) -> tuple[str, str]:
+    if ":" not in record_id:
+        return "", record_id
+    run_id, session_relpath = record_id.split(":", 1)
+    return run_id, session_relpath
+
+
+def summarize_preview_scope(
+    run_id: str,
+    preview_meta: dict[str, Any],
+    state: dict[str, Any],
+) -> dict[str, Any]:
+    included_records = list(preview_meta.get("included_record_ids", []))
+    included_set = set(included_records)
+    current_backlog = list(state.get("merge_backlog", []))
+    backlog_set = set(current_backlog)
+
+    included_run_ids = list(preview_meta.get("included_run_ids", []))
+    if not included_run_ids:
+        included_run_ids = sorted(
+            {
+                split_record_id(record_id)[0]
+                for record_id in included_records
+                if split_record_id(record_id)[0]
+            }
+        )
+
+    included_sessions_count = preview_meta.get("included_sessions_count")
+    if not isinstance(included_sessions_count, int):
+        analysis_records = state.get("analysis_records", {})
+        sessions = {
+            analysis_records.get(record_id, {}).get("session_relpath", "")
+            for record_id in included_records
+        }
+        sessions.discard("")
+        included_sessions_count = len(sessions)
+
+    newer_pending = sorted(backlog_set - included_set)
+    missing_from_backlog = sorted(included_set - backlog_set)
+
+    runs = sorted(state.get("runs", {}).keys())
+    latest_run_id = runs[-1] if runs else run_id
+    is_latest_run = run_id == latest_run_id
+
+    return {
+        "included_records_count": len(included_records),
+        "included_sessions_count": included_sessions_count,
+        "included_run_ids": included_run_ids,
+        "current_backlog_count": len(current_backlog),
+        "newer_pending_count": len(newer_pending),
+        "missing_from_backlog_count": len(missing_from_backlog),
+        "is_latest_run": is_latest_run,
+        "latest_run_id": latest_run_id,
+    }
 
 
 def run_codex(
@@ -920,6 +976,18 @@ def run_command(args: argparse.Namespace) -> int:
     write_text(diff_path, diff_text)
 
     included_record_ids = list(merge_backlog)
+    included_run_ids = sorted(
+        {
+            split_record_id(record_id)[0]
+            for record_id in included_record_ids
+            if split_record_id(record_id)[0]
+        }
+    )
+    included_sessions = {
+        analysis_records.get(record_id, {}).get("session_relpath", "")
+        for record_id in included_record_ids
+    }
+    included_sessions.discard("")
     preview_meta = {
         "run_id": run_id,
         "generated_at": utc_now(),
@@ -928,6 +996,9 @@ def run_command(args: argparse.Namespace) -> int:
         "candidate_agents_path": str(candidate_agents_path),
         "diff_path": str(diff_path),
         "included_record_ids": included_record_ids,
+        "included_run_ids": included_run_ids,
+        "included_sessions_count": len(included_sessions),
+        "backlog_size_at_generation": len(included_record_ids),
         "new_rules_count": len(filtered_new),
         "selected_rules": selected_with_sources,
     }
@@ -944,6 +1015,11 @@ def run_command(args: argparse.Namespace) -> int:
         "Session outcomes: "
         f"ok={ok_count}, no-content={no_content_count}, failed={failed_count}, "
         f"total={completed_count}"
+    )
+    print(
+        "Preview scope: "
+        f"{len(included_record_ids)} pending analysis records "
+        f"from {len(included_run_ids)} run(s)."
     )
     print(f"Processed sessions: {len(run_manifest['processed_sessions'])}")
     print(f"Failed sessions: {len(run_manifest['failed_sessions'])}")
@@ -964,20 +1040,39 @@ def run_command(args: argparse.Namespace) -> int:
     return 0
 
 
-def resolve_run_id(args: argparse.Namespace, state: dict[str, Any]) -> str:
+def resolve_run_id(
+    args: argparse.Namespace,
+    state: dict[str, Any],
+    require_preview_meta: bool = False,
+) -> str:
     if args.run_id:
+        run = state.get("runs", {}).get(args.run_id)
+        if not run:
+            raise RuntimeError(f"Run not found: {args.run_id}")
+        if require_preview_meta and not run.get("preview_meta"):
+            raise RuntimeError(f"Run {args.run_id} has no preview metadata.")
         return args.run_id
-    runs = sorted(state.get("runs", {}).keys())
-    if not runs:
+
+    runs_by_id = state.get("runs", {})
+    run_ids = sorted(runs_by_id.keys())
+    if not run_ids:
         raise RuntimeError("No runs found in state.")
-    return runs[-1]
+
+    if not require_preview_meta:
+        return run_ids[-1]
+
+    for run_id in reversed(run_ids):
+        run = runs_by_id.get(run_id, {})
+        if run.get("preview_meta"):
+            return run_id
+    raise RuntimeError("No runs with preview metadata found.")
 
 
 def preview_command(args: argparse.Namespace) -> int:
     processing_root = Path(args.processing_root).expanduser().resolve()
     state_path = processing_root / "state.json"
     state = load_state(state_path)
-    run_id = resolve_run_id(args, state)
+    run_id = resolve_run_id(args, state, require_preview_meta=True)
     run = state.get("runs", {}).get(run_id)
     if not run:
         raise RuntimeError(f"Run not found: {run_id}")
@@ -989,8 +1084,32 @@ def preview_command(args: argparse.Namespace) -> int:
     diff_path = Path(preview_meta["diff_path"])
     if not diff_path.exists():
         raise RuntimeError(f"Preview diff missing: {diff_path}")
+    scope = summarize_preview_scope(run_id, preview_meta, state)
     print(f"Run id: {run_id}")
     print(f"Diff file: {diff_path}")
+    print(
+        "Preview scope: "
+        f"{scope['included_records_count']} records, "
+        f"{scope['included_sessions_count']} sessions, "
+        f"{len(scope['included_run_ids'])} runs."
+    )
+    print(
+        "Current backlog: "
+        f"{scope['current_backlog_count']} records "
+        f"(newer pending not in this preview: {scope['newer_pending_count']})."
+    )
+    if not scope["is_latest_run"]:
+        print(
+            "WARNING: This is not the latest run preview. "
+            f"Latest run id is {scope['latest_run_id']}."
+        )
+    elif scope["newer_pending_count"] > 0:
+        print(
+            "WARNING: There are pending records not covered by this preview. "
+            "Run `run` again before `apply`."
+        )
+    else:
+        print("Coverage: This preview includes all currently pending records.")
     print()
     print(read_text(diff_path).rstrip())
     return 0
@@ -1001,7 +1120,7 @@ def apply_command(args: argparse.Namespace) -> int:
     state_path = processing_root / "state.json"
     state = load_state(state_path)
 
-    run_id = resolve_run_id(args, state)
+    run_id = resolve_run_id(args, state, require_preview_meta=True)
     run = state.get("runs", {}).get(run_id)
     if not run:
         raise RuntimeError(f"Run not found: {run_id}")
@@ -1017,11 +1136,29 @@ def apply_command(args: argparse.Namespace) -> int:
     if not candidate_agents_path.exists():
         raise RuntimeError(f"Candidate AGENTS missing: {candidate_agents_path}")
 
+    scope = summarize_preview_scope(run_id, preview_meta, state)
+
     current_sha = sha256_file(agents_path)
     expected_sha = preview_meta.get("agents_sha256_before")
     if current_sha != expected_sha and not args.force:
         raise RuntimeError(
             "AGENTS.md changed since preview. Re-run `run` or use `apply --force`."
+        )
+
+    print(
+        "Apply scope: "
+        f"{scope['included_records_count']} records, "
+        f"{scope['included_sessions_count']} sessions, "
+        f"{len(scope['included_run_ids'])} runs."
+    )
+    if not scope["is_latest_run"]:
+        print(
+            "WARNING: Applying a non-latest run preview. "
+            f"Latest run id is {scope['latest_run_id']}."
+        )
+    elif scope["newer_pending_count"] > 0:
+        print(
+            "WARNING: There are newer pending records not covered by this preview."
         )
 
     shutil.copy2(candidate_agents_path, agents_path)
