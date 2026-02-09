@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import argparse
+from concurrent.futures import ThreadPoolExecutor, as_completed
 import datetime as dt
 import difflib
 import hashlib
@@ -22,6 +23,7 @@ AUTO_SECTION_START = "<!-- codex-session-learnings:start -->"
 AUTO_SECTION_END = "<!-- codex-session-learnings:end -->"
 STATE_SCHEMA_VERSION = 1
 DEFAULT_LIMIT = 10
+DEFAULT_WORKERS = 4
 DEFAULT_TIMEOUT_SECONDS = 240
 DEFAULT_MODEL_REASONING = "high"
 MAX_SESSION_MESSAGES = 60
@@ -536,6 +538,94 @@ def copy_sessions_for_run(
     return prepared
 
 
+@dataclass
+class SessionAnalysisResult:
+    relpath: str
+    sha256: str
+    status: str
+    analysis_json_path: str
+    error: str = ""
+
+
+def analyze_prepared_session(
+    prepared: PreparedSession,
+    run_dir: Path,
+    agents_snapshot: str,
+    model: str | None,
+    reasoning: str,
+    timeout_seconds: int,
+) -> SessionAnalysisResult:
+    messages = collect_session_messages(prepared.copied_path)
+    transcript, message_count = compact_session_transcript(messages)
+
+    stem = Path(prepared.relpath).stem
+    analysis_json_path = run_dir / "analysis" / f"{stem}.json"
+    analysis_raw_path = run_dir / "analysis" / f"{stem}.raw.txt"
+    prompt_log_path = run_dir / "logs" / f"{stem}.session_analysis.prompt.txt"
+
+    if message_count == 0:
+        empty_payload = {
+            "marker": SCRIPT_TASK_MARKER,
+            "task_type": "session_analysis",
+            "session_relpath": prepared.relpath,
+            "summary": "No relevant messages after filtering.",
+            "proposals": [],
+            "discarded": [],
+            "no_new_rules_reason": "No relevant transcript content.",
+        }
+        write_text(
+            analysis_json_path,
+            json.dumps(empty_payload, indent=2, ensure_ascii=False) + "\n",
+        )
+        write_text(analysis_raw_path, "No relevant messages for analysis.\n")
+        return SessionAnalysisResult(
+            relpath=prepared.relpath,
+            sha256=prepared.sha256,
+            status="no-content",
+            analysis_json_path=str(analysis_json_path),
+        )
+
+    prompt = build_session_analysis_prompt(
+        relpath=prepared.relpath,
+        analysis_output_hint=analysis_json_path,
+        agents_snapshot=agents_snapshot,
+        transcript=transcript,
+        message_count=message_count,
+    )
+    write_text(prompt_log_path, prompt)
+
+    try:
+        raw_output = run_codex(
+            prompt=prompt,
+            model=model,
+            reasoning=reasoning,
+            timeout_seconds=timeout_seconds,
+        )
+        write_text(analysis_raw_path, raw_output + "\n")
+        parsed = extract_json_object(raw_output)
+        if parsed.get("marker") != SCRIPT_TASK_MARKER:
+            raise ValueError("Invalid marker in session analysis response.")
+        parsed["session_relpath"] = prepared.relpath
+        write_text(analysis_json_path, json.dumps(parsed, indent=2, ensure_ascii=False) + "\n")
+    except Exception as exc:
+        message = str(exc)
+        write_text(analysis_raw_path, f"ERROR: {message}\n")
+        return SessionAnalysisResult(
+            relpath=prepared.relpath,
+            sha256=prepared.sha256,
+            status="failed",
+            analysis_json_path=str(analysis_json_path),
+            error=message,
+        )
+
+    return SessionAnalysisResult(
+        relpath=prepared.relpath,
+        sha256=prepared.sha256,
+        status="ok",
+        analysis_json_path=str(analysis_json_path),
+    )
+
+
 def score_confidence(value: str) -> int:
     return {"low": 1, "medium": 2, "high": 3}.get(value.strip().lower(), 0)
 
@@ -580,6 +670,7 @@ def run_command(args: argparse.Namespace) -> int:
     processing_root = Path(args.processing_root).expanduser().resolve()
     agents_path = Path(args.agents_path).expanduser().resolve()
     limit = max(1, args.limit)
+    workers = max(1, args.workers)
 
     processing_root.mkdir(parents=True, exist_ok=True)
     state_path = processing_root / "state.json"
@@ -593,6 +684,7 @@ def run_command(args: argparse.Namespace) -> int:
         "run_id": run_id,
         "created_at": utc_now(),
         "limit": limit,
+        "workers": workers,
         "selected_sessions": [session.relpath for session in prepared_sessions],
         "processed_sessions": [],
         "failed_sessions": [],
@@ -617,98 +709,71 @@ def run_command(args: argparse.Namespace) -> int:
     failed_sessions = state.setdefault("failed_sessions", {})
     merge_backlog = state.setdefault("merge_backlog", [])
 
-    for prepared in prepared_sessions:
-        messages = collect_session_messages(prepared.copied_path)
-        transcript, message_count = compact_session_transcript(messages)
+    worker_count = min(workers, len(prepared_sessions))
+    run_manifest["effective_workers"] = worker_count
+    future_to_prepared: dict[Any, PreparedSession] = {}
+    model = args.model or None
+    with ThreadPoolExecutor(max_workers=worker_count) as executor:
+        for prepared in prepared_sessions:
+            future = executor.submit(
+                analyze_prepared_session,
+                prepared,
+                run_dir,
+                agents_snapshot,
+                model,
+                args.reasoning,
+                args.timeout_seconds,
+            )
+            future_to_prepared[future] = prepared
 
-        analysis_json_path = run_dir / "analysis" / f"{Path(prepared.relpath).stem}.json"
-        analysis_raw_path = run_dir / "analysis" / f"{Path(prepared.relpath).stem}.raw.txt"
+        for future in as_completed(future_to_prepared):
+            prepared = future_to_prepared[future]
+            try:
+                result = future.result()
+            except Exception as exc:
+                stem = Path(prepared.relpath).stem
+                analysis_json_path = str(run_dir / "analysis" / f"{stem}.json")
+                analysis_raw_path = run_dir / "analysis" / f"{stem}.raw.txt"
+                message = f"Unexpected worker failure: {exc}"
+                write_text(analysis_raw_path, f"ERROR: {message}\n")
+                result = SessionAnalysisResult(
+                    relpath=prepared.relpath,
+                    sha256=prepared.sha256,
+                    status="failed",
+                    analysis_json_path=analysis_json_path,
+                    error=message,
+                )
 
-        if message_count == 0:
-            empty_payload = {
-                "marker": SCRIPT_TASK_MARKER,
-                "task_type": "session_analysis",
-                "session_relpath": prepared.relpath,
-                "summary": "No relevant messages after filtering.",
-                "proposals": [],
-                "discarded": [],
-                "no_new_rules_reason": "No relevant transcript content.",
-            }
-            write_text(analysis_json_path, json.dumps(empty_payload, indent=2, ensure_ascii=False) + "\n")
-            write_text(analysis_raw_path, "No relevant messages for analysis.\n")
-            status_key = prepared.relpath
-            processed_sessions[status_key] = {
+            if result.status == "failed":
+                run_manifest["failed_sessions"].append(result.relpath)
+                failed = failed_sessions.get(result.relpath, {"count": 0})
+                failed["count"] = int(failed.get("count", 0)) + 1
+                failed["last_error"] = result.error
+                failed["last_failed_at"] = utc_now()
+                failed_sessions[result.relpath] = failed
+                save_state(state_path, state)
+                continue
+
+            processed_sessions[result.relpath] = {
                 "processed_at": utc_now(),
-                "sha256": prepared.sha256,
+                "sha256": result.sha256,
                 "run_id": run_id,
-                "analysis_json": str(analysis_json_path),
-                "result": "no-content",
+                "analysis_json": result.analysis_json_path,
+                "result": result.status,
             }
-            record_id = f"{run_id}:{prepared.relpath}"
+            failed_sessions.pop(result.relpath, None)
+
+            record_id = f"{run_id}:{result.relpath}"
             analysis_records[record_id] = {
                 "recorded_at": utc_now(),
                 "run_id": run_id,
-                "session_relpath": prepared.relpath,
-                "analysis_json": str(analysis_json_path),
+                "session_relpath": result.relpath,
+                "analysis_json": result.analysis_json_path,
             }
             if record_id not in merge_backlog:
                 merge_backlog.append(record_id)
-            run_manifest["processed_sessions"].append(prepared.relpath)
-            continue
-
-        prompt = build_session_analysis_prompt(
-            relpath=prepared.relpath,
-            analysis_output_hint=analysis_json_path,
-            agents_snapshot=agents_snapshot,
-            transcript=transcript,
-            message_count=message_count,
-        )
-        write_text(run_dir / "logs" / f"{Path(prepared.relpath).stem}.session_analysis.prompt.txt", prompt)
-
-        try:
-            raw_output = run_codex(
-                prompt=prompt,
-                model=args.model,
-                reasoning=args.reasoning,
-                timeout_seconds=args.timeout_seconds,
-            )
-            write_text(analysis_raw_path, raw_output + "\n")
-            parsed = extract_json_object(raw_output)
-            if parsed.get("marker") != SCRIPT_TASK_MARKER:
-                raise ValueError("Invalid marker in session analysis response.")
-            parsed["session_relpath"] = prepared.relpath
-            write_text(analysis_json_path, json.dumps(parsed, indent=2, ensure_ascii=False) + "\n")
-        except Exception as exc:
-            run_manifest["failed_sessions"].append(prepared.relpath)
-            failed = failed_sessions.get(prepared.relpath, {"count": 0})
-            failed["count"] = int(failed.get("count", 0)) + 1
-            failed["last_error"] = str(exc)
-            failed["last_failed_at"] = utc_now()
-            failed_sessions[prepared.relpath] = failed
-            write_text(analysis_raw_path, f"ERROR: {exc}\n")
-            continue
-
-        status_key = prepared.relpath
-        processed_sessions[status_key] = {
-            "processed_at": utc_now(),
-            "sha256": prepared.sha256,
-            "run_id": run_id,
-            "analysis_json": str(analysis_json_path),
-            "result": "ok",
-        }
-        failed_sessions.pop(prepared.relpath, None)
-
-        record_id = f"{run_id}:{prepared.relpath}"
-        analysis_records[record_id] = {
-            "recorded_at": utc_now(),
-            "run_id": run_id,
-            "session_relpath": prepared.relpath,
-            "analysis_json": str(analysis_json_path),
-        }
-        if record_id not in merge_backlog:
-            merge_backlog.append(record_id)
-        run_manifest["processed_sessions"].append(prepared.relpath)
-        save_state(state_path, state)
+            run_manifest["processed_sessions"].append(result.relpath)
+            save_state(state_path, state)
 
     save_state(state_path, state)
 
@@ -833,6 +898,7 @@ def run_command(args: argparse.Namespace) -> int:
 
     print(f"Run id: {run_id}")
     print(f"Selected sessions: {len(prepared_sessions)}")
+    print(f"Workers: {worker_count}")
     print(f"Processed sessions: {len(run_manifest['processed_sessions'])}")
     print(f"Failed sessions: {len(run_manifest['failed_sessions'])}")
     print(f"Preview diff: {diff_path}")
@@ -996,6 +1062,15 @@ def build_parser() -> argparse.ArgumentParser:
         type=int,
         default=DEFAULT_LIMIT,
         help=f"Maximum pending sessions to process (default: {DEFAULT_LIMIT}).",
+    )
+    run_parser.add_argument(
+        "--workers",
+        type=int,
+        default=DEFAULT_WORKERS,
+        help=(
+            "Parallel session analyses during run "
+            f"(default: {DEFAULT_WORKERS})."
+        ),
     )
     run_parser.add_argument(
         "--print-preview",
