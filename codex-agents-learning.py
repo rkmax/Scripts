@@ -64,6 +64,14 @@ def write_text(path: Path, content: str) -> None:
     path.write_text(content, encoding="utf-8")
 
 
+def resolve_path(value: str) -> Path:
+    return Path(value).expanduser().resolve()
+
+
+def write_json(path: Path, payload: Any) -> None:
+    write_text(path, json.dumps(payload, indent=2, ensure_ascii=False) + "\n")
+
+
 def sha256_file(path: Path) -> str:
     digest = hashlib.sha256()
     with path.open("rb") as handle:
@@ -175,12 +183,12 @@ def update_agents_text(agents_text: str, rules: list[str]) -> str:
 def build_diff(original: str, updated: str, file_label: str) -> str:
     diff_lines = list(
         difflib.unified_diff(
-        original.splitlines(),
-        updated.splitlines(),
-        fromfile=file_label,
-        tofile=f"{file_label}.candidate",
-        lineterm="",
-    )
+            original.splitlines(),
+            updated.splitlines(),
+            fromfile=file_label,
+            tofile=f"{file_label}.candidate",
+            lineterm="",
+        )
     )
     if not diff_lines:
         return ""
@@ -211,7 +219,7 @@ def load_state(path: Path) -> dict[str, Any]:
 def save_state(path: Path, state: dict[str, Any]) -> None:
     state["schema_version"] = STATE_SCHEMA_VERSION
     state["script_task_marker"] = SCRIPT_TASK_MARKER
-    write_text(path, json.dumps(state, indent=2, ensure_ascii=False) + "\n")
+    write_json(path, state)
 
 
 def split_record_id(record_id: str) -> tuple[str, str]:
@@ -509,8 +517,8 @@ CANDIDATES
 
 
 def list_command(args: argparse.Namespace) -> int:
-    codex_home = Path(args.codex_home).expanduser().resolve()
-    processing_root = Path(args.processing_root).expanduser().resolve()
+    codex_home = resolve_path(args.codex_home)
+    processing_root = resolve_path(args.processing_root)
     state_path = processing_root / "state.json"
     state = load_state(state_path)
 
@@ -634,10 +642,7 @@ def analyze_prepared_session(
             "discarded": [],
             "no_new_rules_reason": "No relevant transcript content.",
         }
-        write_text(
-            analysis_json_path,
-            json.dumps(empty_payload, indent=2, ensure_ascii=False) + "\n",
-        )
+        write_json(analysis_json_path, empty_payload)
         write_text(analysis_raw_path, "No relevant messages for analysis.\n")
         return SessionAnalysisResult(
             relpath=prepared.relpath,
@@ -667,7 +672,7 @@ def analyze_prepared_session(
         if parsed.get("marker") != SCRIPT_TASK_MARKER:
             raise ValueError("Invalid marker in session analysis response.")
         parsed["session_relpath"] = prepared.relpath
-        write_text(analysis_json_path, json.dumps(parsed, indent=2, ensure_ascii=False) + "\n")
+        write_json(analysis_json_path, parsed)
     except Exception as exc:
         message = str(exc)
         write_text(analysis_raw_path, f"ERROR: {message}\n")
@@ -726,10 +731,16 @@ def deduplicate_candidates(analysis_items: list[dict[str, Any]]) -> list[dict[st
     return list(grouped.values())
 
 
+def update_progress(progress: Any, ok_count: int, no_content_count: int, failed_count: int) -> None:
+    if progress is not None:
+        progress.update(1)
+        progress.set_postfix(ok=ok_count, no_content=no_content_count, failed=failed_count)
+
+
 def run_command(args: argparse.Namespace) -> int:
-    codex_home = Path(args.codex_home).expanduser().resolve()
-    processing_root = Path(args.processing_root).expanduser().resolve()
-    agents_path = Path(args.agents_path).expanduser().resolve()
+    codex_home = resolve_path(args.codex_home)
+    processing_root = resolve_path(args.processing_root)
+    agents_path = resolve_path(args.agents_path)
     limit = max(1, args.limit)
     workers = max(1, args.workers)
     enable_progress = not args.no_progress
@@ -835,9 +846,7 @@ def run_command(args: argparse.Namespace) -> int:
                 failed_sessions[result.relpath] = failed
                 save_state(state_path, state)
                 completed_count += 1
-                if progress is not None:
-                    progress.update(1)
-                    progress.set_postfix(ok=ok_count, no_content=no_content_count, failed=failed_count)
+                update_progress(progress, ok_count, no_content_count, failed_count)
                 continue
 
             if result.status == "ok":
@@ -865,9 +874,7 @@ def run_command(args: argparse.Namespace) -> int:
             run_manifest["processed_sessions"].append(result.relpath)
             save_state(state_path, state)
             completed_count += 1
-            if progress is not None:
-                progress.update(1)
-                progress.set_postfix(ok=ok_count, no_content=no_content_count, failed=failed_count)
+            update_progress(progress, ok_count, no_content_count, failed_count)
 
     if progress is not None:
         progress.close()
@@ -917,10 +924,7 @@ def run_command(args: argparse.Namespace) -> int:
         consolidated = extract_json_object(raw_consolidation)
         if consolidated.get("marker") != SCRIPT_TASK_MARKER:
             raise RuntimeError("Invalid marker in consolidation response.")
-        write_text(
-            consolidation_json_path,
-            json.dumps(consolidated, indent=2, ensure_ascii=False) + "\n",
-        )
+        write_json(consolidation_json_path, consolidated)
         selected = consolidated.get("selected_rules", [])
         if isinstance(selected, list):
             for entry in selected:
@@ -939,19 +943,14 @@ def run_command(args: argparse.Namespace) -> int:
                 )
     else:
         write_text(consolidation_raw_path, "No candidate proposals in merge backlog.\n")
-        write_text(
+        write_json(
             consolidation_json_path,
-            json.dumps(
-                {
-                    "marker": SCRIPT_TASK_MARKER,
-                    "task_type": "consolidate_proposals",
-                    "selected_rules": [],
-                    "rejected_rules": [],
-                },
-                indent=2,
-                ensure_ascii=False,
-            )
-            + "\n",
+            {
+                "marker": SCRIPT_TASK_MARKER,
+                "task_type": "consolidate_proposals",
+                "selected_rules": [],
+                "rejected_rules": [],
+            },
         )
 
     existing_auto_rules = extract_existing_auto_rules(agents_snapshot)
@@ -1002,7 +1001,7 @@ def run_command(args: argparse.Namespace) -> int:
         "new_rules_count": len(filtered_new),
         "selected_rules": selected_with_sources,
     }
-    write_text(preview_meta_path, json.dumps(preview_meta, indent=2, ensure_ascii=False) + "\n")
+    write_json(preview_meta_path, preview_meta)
 
     run_manifest["preview_generated"] = True
     run_manifest["preview_meta"] = str(preview_meta_path)
@@ -1068,19 +1067,26 @@ def resolve_run_id(
     raise RuntimeError("No runs with preview metadata found.")
 
 
-def preview_command(args: argparse.Namespace) -> int:
-    processing_root = Path(args.processing_root).expanduser().resolve()
-    state_path = processing_root / "state.json"
-    state = load_state(state_path)
-    run_id = resolve_run_id(args, state, require_preview_meta=True)
+def load_run_preview_meta(
+    state: dict[str, Any],
+    run_id: str,
+) -> tuple[dict[str, Any], dict[str, Any]]:
     run = state.get("runs", {}).get(run_id)
     if not run:
         raise RuntimeError(f"Run not found: {run_id}")
     preview_meta_path = run.get("preview_meta")
     if not preview_meta_path:
         raise RuntimeError(f"Run {run_id} has no preview metadata.")
-
     preview_meta = json.loads(read_text(Path(preview_meta_path)))
+    return run, preview_meta
+
+
+def preview_command(args: argparse.Namespace) -> int:
+    processing_root = resolve_path(args.processing_root)
+    state_path = processing_root / "state.json"
+    state = load_state(state_path)
+    run_id = resolve_run_id(args, state, require_preview_meta=True)
+    _, preview_meta = load_run_preview_meta(state, run_id)
     diff_path = Path(preview_meta["diff_path"])
     if not diff_path.exists():
         raise RuntimeError(f"Preview diff missing: {diff_path}")
@@ -1116,19 +1122,12 @@ def preview_command(args: argparse.Namespace) -> int:
 
 
 def apply_command(args: argparse.Namespace) -> int:
-    processing_root = Path(args.processing_root).expanduser().resolve()
+    processing_root = resolve_path(args.processing_root)
     state_path = processing_root / "state.json"
     state = load_state(state_path)
 
     run_id = resolve_run_id(args, state, require_preview_meta=True)
-    run = state.get("runs", {}).get(run_id)
-    if not run:
-        raise RuntimeError(f"Run not found: {run_id}")
-    preview_meta_path = run.get("preview_meta")
-    if not preview_meta_path:
-        raise RuntimeError(f"Run {run_id} has no preview metadata.")
-
-    preview_meta = json.loads(read_text(Path(preview_meta_path)))
+    run, preview_meta = load_run_preview_meta(state, run_id)
     agents_path = Path(preview_meta["agents_path"])
     candidate_agents_path = Path(preview_meta["candidate_agents_path"])
     if not agents_path.exists():
@@ -1298,16 +1297,16 @@ def main() -> int:
     parser = build_parser()
     args = parser.parse_args()
 
-    command = args.command
-    if command == "list":
-        return list_command(args)
-    if command == "run":
-        return run_command(args)
-    if command == "preview":
-        return preview_command(args)
-    if command == "apply":
-        return apply_command(args)
-    parser.error(f"Unknown command: {command}")
+    handlers = {
+        "list": list_command,
+        "run": run_command,
+        "preview": preview_command,
+        "apply": apply_command,
+    }
+    handler = handlers.get(args.command)
+    if handler:
+        return handler(args)
+    parser.error(f"Unknown command: {args.command}")
     return 2
 
 
