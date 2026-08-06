@@ -1,0 +1,130 @@
+#!/bin/bash
+# youtube-music-broker - Focus an existing YouTube Music app window or launch it
+
+set -euo pipefail
+
+readonly DEBUG="${YOUTUBE_MUSIC_BROKER_DEBUG:-0}"
+readonly SILENT="${YOUTUBE_MUSIC_BROKER_SILENT:-0}"
+readonly APP_ID="cinhimbnkkaeohfgghhklpknlkffjgod"
+readonly APP_CLASS="chrome-${APP_ID}-Default"
+readonly STARTUP_WM_CLASS="crx_${APP_ID}"
+readonly CHROME_BIN="/opt/google/chrome/google-chrome"
+readonly FALLBACK_URL="https://music.youtube.com/?source=pwa"
+
+log_debug() { [[ "$DEBUG" == "1" ]] && echo "[DEBUG] $*" >&2; }
+log_error() { [[ "$SILENT" != "1" ]] && echo "[ERROR] $*" >&2; }
+log_info() { [[ "$DEBUG" == "1" ]] && echo "[INFO] $*" >&2; }
+
+check_dependencies() {
+    local missing=()
+    for dep in hyprctl jq nohup xdg-open; do
+        command -v "$dep" >/dev/null || missing+=("$dep")
+    done
+    [[ -x "$CHROME_BIN" ]] || missing+=("$CHROME_BIN")
+    [[ ${#missing[@]} -eq 0 ]] || { log_error "Missing: ${missing[*]}"; exit 1; }
+}
+
+get_music_windows() {
+    timeout 10 hyprctl clients -j 2>/dev/null | jq -r \
+        --arg app_class "$APP_CLASS" \
+        --arg startup_wm_class "$STARTUP_WM_CLASS" \
+        '
+        .[]
+        | select(
+            .class == $app_class
+            or .initialClass == $app_class
+            or .class == $startup_wm_class
+            or .initialClass == $startup_wm_class
+          )
+        | "\(.address)\t\(.focusHistoryID)\t\(.title)"
+        ' || {
+        log_error "Failed to query Hyprland clients"
+        return 1
+    }
+}
+
+find_most_recent_window_address() {
+    local windows most_recent_address="" most_recent_focus=999999
+
+    windows=$(get_music_windows) || return 1
+    [[ -n "$windows" ]] || return 1
+
+    while IFS=$'\t' read -r address focus_id title; do
+        [[ -n "$address" ]] || continue
+        log_debug "Window: Address=$address Focus=$focus_id Title=$title"
+        if [[ "$focus_id" -lt "$most_recent_focus" ]]; then
+            most_recent_focus="$focus_id"
+            most_recent_address="$address"
+        fi
+    done <<< "$windows"
+
+    [[ -n "$most_recent_address" ]] || return 1
+    printf '%s\n' "$most_recent_address"
+}
+
+focus_existing_window() {
+    local address="$1"
+    log_info "Focusing existing YouTube Music window: $address"
+    timeout 10 hyprctl dispatch focuswindow "address:$address" >/dev/null 2>&1
+}
+
+wait_for_music_window() {
+    local attempts="${1:-20}" address=""
+
+    for ((i = 0; i < attempts; i++)); do
+        if address=$(find_most_recent_window_address 2>/dev/null); then
+            printf '%s\n' "$address"
+            return 0
+        fi
+
+        sleep 0.25
+    done
+
+    return 1
+}
+
+launch_music_app() {
+    local address="" pid=""
+
+    log_info "Launching YouTube Music app"
+    nohup "$CHROME_BIN" --profile-directory=Default --app-id="$APP_ID" </dev/null >/dev/null 2>&1 &
+    pid=$!
+    disown "$pid" 2>/dev/null || true
+
+    if address=$(wait_for_music_window); then
+        focus_existing_window "$address" || true
+        return 0
+    fi
+
+    log_error "Chrome app launch did not produce a YouTube Music window"
+    return 1
+}
+
+open_music_url() {
+    log_info "Falling back to URL launch: $FALLBACK_URL"
+    nohup xdg-open "$FALLBACK_URL" </dev/null >/dev/null 2>&1 &
+    local pid=$!
+    disown "$pid" 2>/dev/null || true
+}
+
+main() {
+    local address=""
+
+    check_dependencies
+
+    if address=$(find_most_recent_window_address); then
+        if focus_existing_window "$address"; then
+            exit 0
+        fi
+
+        log_error "Failed to focus existing YouTube Music window, launching a new one"
+    fi
+
+    if launch_music_app; then
+        exit 0
+    fi
+
+    open_music_url
+}
+
+main "$@"
