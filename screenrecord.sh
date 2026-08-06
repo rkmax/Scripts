@@ -160,7 +160,14 @@ function start_recording() {
 
     echo "Recording video to $filepath"
 
-    local -a wf_args=(-g "$selection" -f "$filepath" --codec libx264)
+    # Force a standard SDR H.264 output instead of relying on wf-recorder defaults.
+    local -a wf_args=(
+        -g "$selection"
+        -f "$filepath"
+        --codec libx264
+        --pixel-format yuv420p
+        --codec-param x264-params=range=tv:colorprim=bt709:transfer=bt709:colormatrix=bt709
+    )
     if $enable_audio; then
         wf_args+=("--audio=$audio_device")
     fi
