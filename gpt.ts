@@ -1,71 +1,40 @@
-#!/usr/bin/env -S deno run --allow-net --allow-env --allow-run --allow-read --allow-write
+#!/usr/bin/env -S deno run --allow-run --allow-env --allow-read --allow-write --allow-net
 
-import { load } from "jsr:@std/dotenv";
-import { DatabaseSync } from "node:sqlite";
-import { createDB, saveToDB } from "./gpt-db.ts";
-
-const DEFAULT_MODEL = "gpt-4o-mini";
-const DEFAULT_SYSTEM = `You're an in-line zsh assistant running on archlinux.
-Your task is to answer the questions without any commentation at all, providing only the code to run on terminal.
-You can assume that the user understands that they need to fill in placeholders like <PORT>.
-You're not allowed to explain anything and you're not a chatbot.
-You only provide shell commands or code.
-Keep the responses to one-liner answers as much as possible. Do not decorate the answer with tickmarks`;
-
-async function fetchResponse(
-  apiKey: string,
-  prompt: string,
-  systemPrompt: string,
-  db: DatabaseSync,
-): Promise<string> {
-  const url = "https://api.openai.com/v1/chat/completions";
-
-  const headers = {
-    "Content-Type": "application/json",
-    Authorization: `Bearer ${apiKey}`,
-  };
-
-  const body = JSON.stringify({
-    model: DEFAULT_MODEL,
-    messages: [
-      { role: "system", content: systemPrompt },
-      { role: "user", content: prompt },
-    ],
-  });
-
-  const response = await fetch(url, {
-    method: "POST",
-    headers,
-    body,
-  });
-
-  const data = await response.json();
-  const content = data.choices[0].message.content;
-
-  saveToDB(db, prompt, content);
-
-  return content;
-}
+const home = Deno.env.get("HOME") || "";
+const targetScript = `${home}/Development/Personal/shell-command-lab/src/command_assistant.ts`;
 
 async function main() {
-  await load({ export: true });
-  const apiKey = Deno.env.get("OPENAI_API_KEY") || "";
-  const prompt = Deno.args.join(" ");
-
-  if (!apiKey) {
-    throw new Error("OPENAI_API_KEY environment variable is not set.");
+  let stat: Deno.FileInfo;
+  try {
+    stat = await Deno.stat(targetScript);
+  } catch {
+    throw new Error(
+      `Missing command assistant script at ${targetScript}.`,
+    );
   }
 
-  const db = createDB();
+  if (!stat.isFile) {
+    throw new Error(`Target path is not a file: ${targetScript}`);
+  }
 
-  try {
-    const response = await fetchResponse(apiKey, prompt, DEFAULT_SYSTEM, db);
-    Deno.stdout.write(new TextEncoder().encode(response));
-  } finally {
-    db.close();
+  const proc = new Deno.Command(targetScript, {
+    args: Deno.args,
+    stdout: "inherit",
+    stderr: "inherit",
+  }).spawn();
+
+  const status = await proc.status;
+  if (!status.success) {
+    Deno.exit(status.code);
   }
 }
 
 if (import.meta.main) {
-  await main();
+  try {
+    await main();
+  } catch (error) {
+    const message = error instanceof Error ? error.message : String(error);
+    console.error(`Error: ${message}`);
+    Deno.exit(1);
+  }
 }
