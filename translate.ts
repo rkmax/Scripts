@@ -84,7 +84,11 @@ function sanitize(text: string): string {
 }
 
 async function main() {
-  await load({ export: true });
+  const homeDir = Deno.env.get("HOME");
+  if (!homeDir) {
+    throw new Error("HOME environment variable must be set");
+  }
+  await load({ export: true, envPath: `${homeDir}/.env` });
 
   try {
     const systemPrompt = Deno.args.length > 0
