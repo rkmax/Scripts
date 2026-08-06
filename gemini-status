@@ -1,0 +1,183 @@
+#!/usr/bin/env python3
+
+from __future__ import annotations
+
+import argparse
+import json
+import os
+import sys
+from datetime import datetime, timedelta
+from pathlib import Path
+from typing import Any
+
+
+LOCAL_TZ = datetime.now().astimezone().tzinfo
+
+
+def parse_args() -> argparse.Namespace:
+    parser = argparse.ArgumentParser(
+        description="Show a local Gemini usage snapshot from Gemini CLI chat logs."
+    )
+    parser.add_argument(
+        "--gemini-home",
+        default=os.environ.get("GEMINI_HOME", "~/.gemini"),
+        help="Path to the Gemini home directory (default: ~/.gemini).",
+    )
+    parser.add_argument(
+        "--json",
+        action="store_true",
+        dest="json_output",
+        help="Print the snapshot as JSON.",
+    )
+    return parser.parse_args()
+
+
+def resolve_path(raw_path: str) -> Path:
+    return Path(raw_path).expanduser().resolve()
+
+
+def parse_iso_timestamp(raw_timestamp: Any) -> datetime | None:
+    if not isinstance(raw_timestamp, str):
+        return None
+    try:
+        parsed = datetime.fromisoformat(raw_timestamp.replace("Z", "+00:00"))
+    except ValueError:
+        return None
+    if parsed.tzinfo is None:
+        return parsed.replace(tzinfo=LOCAL_TZ)
+    return parsed.astimezone(LOCAL_TZ)
+
+
+def format_datetime(raw_datetime: datetime | None) -> str | None:
+    if raw_datetime is None:
+        return None
+    return raw_datetime.astimezone().strftime("%Y-%m-%d %H:%M:%S %Z")
+
+
+def compact_number(value: int | float | None) -> str:
+    if value is None:
+        return "--"
+    value = int(value)
+    sign = "-" if value < 0 else ""
+    value = abs(value)
+    for suffix, divisor in (("B", 1_000_000_000), ("M", 1_000_000), ("K", 1_000)):
+        if value >= divisor:
+            return f"{sign}{value / divisor:.1f}{suffix}".replace(".0", "")
+    return f"{sign}{value}"
+
+
+def token_total(tokens: Any) -> int:
+    if not isinstance(tokens, dict):
+        return 0
+    total = tokens.get("total")
+    if isinstance(total, (int, float)):
+        return int(total)
+    fields = ("input", "output", "cached", "thoughts", "tool")
+    return sum(int(tokens.get(field) or 0) for field in fields)
+
+
+def iter_chat_files(gemini_home: Path) -> list[Path]:
+    search_roots = [gemini_home / "tmp", gemini_home / "history"]
+    files: list[Path] = []
+    for root in search_roots:
+        if root.is_dir():
+            files.extend(root.rglob("chats/session-*.json"))
+    return sorted(files, key=lambda path: path.stat().st_mtime, reverse=True)
+
+
+def iter_messages(gemini_home: Path):
+    for path in iter_chat_files(gemini_home):
+        try:
+            payload = json.loads(path.read_text(encoding="utf-8"))
+        except (OSError, json.JSONDecodeError):
+            continue
+        messages = payload.get("messages")
+        if not isinstance(messages, list):
+            continue
+        for message in messages:
+            if isinstance(message, dict):
+                yield path, payload, message
+
+
+def find_snapshot(gemini_home: Path) -> dict[str, Any]:
+    now = datetime.now().astimezone()
+    cutoff = now - timedelta(hours=24)
+    daily_tokens = 0
+    latest_time: datetime | None = None
+    latest_tokens = 0
+    latest_model = "unknown"
+    latest_source: Path | None = None
+
+    for path, _payload, message in iter_messages(gemini_home):
+        timestamp = parse_iso_timestamp(message.get("timestamp"))
+        total = token_total(message.get("tokens"))
+        if timestamp and timestamp >= cutoff:
+            daily_tokens += total
+        if total > 0 and (latest_time is None or (timestamp and timestamp > latest_time)):
+            latest_time = timestamp
+            latest_tokens = total
+            latest_model = str(message.get("model") or "unknown")
+            latest_source = path
+
+    return {
+        "provider": "gemini",
+        "provider_label": "Gemini",
+        "provider_short_label": "GEM",
+        "source": str(latest_source) if latest_source else None,
+        "snapshot_at_local": format_datetime(now),
+        "plan_type": "local CLI logs",
+        "primary": {
+            "window_label": "last",
+            "used_percent": None,
+            "used_label": compact_number(latest_tokens),
+            "resets_at_epoch": None,
+            "resets_at_local": None,
+        },
+        "secondary": {
+            "window_label": "24h",
+            "used_percent": None,
+            "used_label": compact_number(daily_tokens),
+            "resets_at_epoch": None,
+            "resets_at_local": None,
+        },
+        "details": [
+            f"Latest model: {latest_model}",
+            f"Latest turn tokens: {compact_number(latest_tokens)}",
+            f"24h local tokens: {compact_number(daily_tokens)}",
+            "Quota percent and reset time are not exposed in local Gemini CLI logs.",
+        ],
+    }
+
+
+def print_human(snapshot: dict[str, Any]) -> None:
+    print("Gemini usage snapshot")
+    print(f"Snapshot: {snapshot.get('snapshot_at_local') or 'unknown'}")
+    for key in ("primary", "secondary"):
+        window = snapshot.get(key)
+        if isinstance(window, dict):
+            print(
+                f"{window.get('window_label') or key}: "
+                f"{window.get('used_label') or '--'}"
+            )
+
+
+def main() -> int:
+    args = parse_args()
+    gemini_home = resolve_path(args.gemini_home)
+
+    try:
+        snapshot = find_snapshot(gemini_home)
+    except Exception as error:  # noqa: BLE001
+        print(f"Error: {error}", file=sys.stderr)
+        return 1
+
+    if args.json_output:
+        print(json.dumps(snapshot, indent=2))
+        return 0
+
+    print_human(snapshot)
+    return 0
+
+
+if __name__ == "__main__":
+    raise SystemExit(main())

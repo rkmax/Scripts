@@ -1,0 +1,267 @@
+#!/usr/bin/env python3
+
+from __future__ import annotations
+
+import argparse
+import json
+import os
+import sys
+from datetime import datetime, timezone
+from pathlib import Path
+from typing import Any
+
+
+def parse_args() -> argparse.Namespace:
+    parser = argparse.ArgumentParser(
+        description=(
+            "Show the latest Codex usage snapshot persisted in ~/.codex/sessions."
+        )
+    )
+    parser.add_argument(
+        "--codex-home",
+        default=os.environ.get("CODEX_HOME", "~/.codex"),
+        help="Path to the Codex home directory (default: ~/.codex).",
+    )
+    parser.add_argument(
+        "--json",
+        action="store_true",
+        dest="json_output",
+        help="Print the snapshot as JSON.",
+    )
+    parser.add_argument(
+        "--show-session-tokens",
+        action="store_true",
+        help="Include session and last-turn token counters from the snapshot.",
+    )
+    return parser.parse_args()
+
+
+def resolve_path(raw_path: str) -> Path:
+    return Path(raw_path).expanduser().resolve()
+
+
+def iter_lines_reverse(path: Path, chunk_size: int = 65536):
+    with path.open("rb") as handle:
+        handle.seek(0, os.SEEK_END)
+        position = handle.tell()
+        buffer = b""
+
+        while position > 0:
+            read_size = min(chunk_size, position)
+            position -= read_size
+            handle.seek(position)
+            chunk = handle.read(read_size)
+            buffer = chunk + buffer
+            lines = buffer.split(b"\n")
+            buffer = lines[0]
+
+            for line in reversed(lines[1:]):
+                if line:
+                    yield line.decode("utf-8", errors="replace")
+
+        if buffer:
+            yield buffer.decode("utf-8", errors="replace")
+
+
+def format_window(minutes: Any) -> str | None:
+    if not isinstance(minutes, int) or minutes <= 0:
+        return None
+    if minutes % 10080 == 0:
+        weeks = minutes // 10080
+        return f"{weeks}w"
+    if minutes % 1440 == 0:
+        days = minutes // 1440
+        return f"{days}d"
+    if minutes % 60 == 0:
+        hours = minutes // 60
+        return f"{hours}h"
+    return f"{minutes}m"
+
+
+def format_percent(value: Any) -> str:
+    if isinstance(value, int):
+        return f"{value}%"
+    if isinstance(value, float):
+        return f"{value:.1f}%"
+    return "n/a"
+
+
+def parse_iso_timestamp(raw_timestamp: Any) -> datetime | None:
+    if not isinstance(raw_timestamp, str):
+        return None
+    try:
+        return datetime.fromisoformat(raw_timestamp.replace("Z", "+00:00"))
+    except ValueError:
+        return None
+
+
+def parse_epoch_timestamp(raw_timestamp: Any) -> datetime | None:
+    if not isinstance(raw_timestamp, int):
+        return None
+    try:
+        return datetime.fromtimestamp(raw_timestamp, tz=timezone.utc)
+    except (OverflowError, OSError, ValueError):
+        return None
+
+
+def format_datetime(raw_datetime: datetime | None) -> str | None:
+    if raw_datetime is None:
+        return None
+    return raw_datetime.astimezone().strftime("%Y-%m-%d %H:%M:%S %Z")
+
+
+def build_window_snapshot(window: dict[str, Any] | None) -> dict[str, Any] | None:
+    if not isinstance(window, dict):
+        return None
+
+    used_percent = window.get("used_percent")
+    left_percent = None
+    if isinstance(used_percent, (int, float)):
+        left_percent = max(0.0, 100.0 - float(used_percent))
+
+    reset_at = parse_epoch_timestamp(window.get("resets_at"))
+
+    return {
+        "used_percent": used_percent,
+        "left_percent": left_percent,
+        "window_minutes": window.get("window_minutes"),
+        "window_label": format_window(window.get("window_minutes")),
+        "resets_at_epoch": window.get("resets_at"),
+        "resets_at_local": format_datetime(reset_at),
+        "resets_at_iso": reset_at.isoformat() if reset_at else None,
+    }
+
+
+def extract_snapshot_from_file(path: Path) -> dict[str, Any] | None:
+    for raw_line in iter_lines_reverse(path):
+        raw_line = raw_line.strip()
+        if not raw_line:
+            continue
+
+        try:
+            event = json.loads(raw_line)
+        except json.JSONDecodeError:
+            continue
+
+        if event.get("type") != "event_msg":
+            continue
+
+        payload = event.get("payload")
+        if not isinstance(payload, dict) or payload.get("type") != "token_count":
+            continue
+
+        rate_limits = payload.get("rate_limits")
+        if not isinstance(rate_limits, dict):
+            continue
+
+        info = payload.get("info")
+        if not isinstance(info, dict):
+            info = {}
+
+        timestamp = parse_iso_timestamp(event.get("timestamp"))
+        total_usage = info.get("total_token_usage")
+        last_usage = info.get("last_token_usage")
+
+        return {
+            "source": str(path),
+            "snapshot_at_local": format_datetime(timestamp),
+            "snapshot_at_iso": timestamp.isoformat() if timestamp else None,
+            "plan_type": rate_limits.get("plan_type"),
+            "limit_id": rate_limits.get("limit_id"),
+            "limit_name": rate_limits.get("limit_name"),
+            "primary": build_window_snapshot(rate_limits.get("primary")),
+            "secondary": build_window_snapshot(rate_limits.get("secondary")),
+            "session_total_tokens": (
+                total_usage.get("total_tokens")
+                if isinstance(total_usage, dict)
+                else None
+            ),
+            "last_turn_tokens": (
+                last_usage.get("total_tokens") if isinstance(last_usage, dict) else None
+            ),
+            "model_context_window": info.get("model_context_window"),
+        }
+
+    return None
+
+
+def find_latest_snapshot(codex_home: Path) -> dict[str, Any]:
+    sessions_root = codex_home / "sessions"
+    if not sessions_root.is_dir():
+        raise FileNotFoundError(
+            f"Codex sessions directory not found: {sessions_root}"
+        )
+
+    session_files = sorted(
+        sessions_root.rglob("*.jsonl"),
+        key=lambda path: path.stat().st_mtime,
+        reverse=True,
+    )
+
+    for session_file in session_files:
+        snapshot = extract_snapshot_from_file(session_file)
+        if snapshot is not None:
+            return snapshot
+
+    raise RuntimeError(
+        f"No token_count snapshot with rate limits found under {sessions_root}"
+    )
+
+
+def print_human(snapshot: dict[str, Any], show_session_tokens: bool) -> None:
+    print("Codex usage snapshot")
+    print(f"Plan: {snapshot.get('plan_type') or 'unknown'}")
+    print(f"Snapshot: {snapshot.get('snapshot_at_local') or 'unknown'}")
+    print(f"Source: {snapshot['source']}")
+
+    for label in ("primary", "secondary"):
+        window = snapshot.get(label)
+        if not isinstance(window, dict):
+            continue
+
+        window_name = label.capitalize()
+        window_label = window.get("window_label") or "unknown"
+        used_percent = format_percent(window.get("used_percent"))
+        left_percent = format_percent(window.get("left_percent"))
+        reset_at = window.get("resets_at_local") or "unknown"
+
+        print(
+            f"{window_name} ({window_label}): "
+            f"{used_percent} used, {left_percent} left, resets {reset_at}"
+        )
+
+    if show_session_tokens:
+        print(
+            f"Session total tokens: "
+            f"{snapshot.get('session_total_tokens') if snapshot.get('session_total_tokens') is not None else 'n/a'}"
+        )
+        print(
+            f"Last turn tokens: "
+            f"{snapshot.get('last_turn_tokens') if snapshot.get('last_turn_tokens') is not None else 'n/a'}"
+        )
+        print(
+            f"Model context window: "
+            f"{snapshot.get('model_context_window') if snapshot.get('model_context_window') is not None else 'n/a'}"
+        )
+
+
+def main() -> int:
+    args = parse_args()
+    codex_home = resolve_path(args.codex_home)
+
+    try:
+        snapshot = find_latest_snapshot(codex_home)
+    except (FileNotFoundError, RuntimeError) as error:
+        print(f"Error: {error}", file=sys.stderr)
+        return 1
+
+    if args.json_output:
+        print(json.dumps(snapshot, indent=2))
+        return 0
+
+    print_human(snapshot, show_session_tokens=args.show_session_tokens)
+    return 0
+
+
+if __name__ == "__main__":
+    raise SystemExit(main())

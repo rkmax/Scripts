@@ -1,0 +1,409 @@
+#!/usr/bin/env python3
+
+from __future__ import annotations
+
+import argparse
+import json
+import os
+import re
+import sys
+from datetime import datetime, timedelta
+from pathlib import Path
+from typing import Any
+
+try:
+    from zoneinfo import ZoneInfo
+except ImportError:  # pragma: no cover
+    ZoneInfo = None  # type: ignore[assignment]
+
+
+LOCAL_TZ = datetime.now().astimezone().tzinfo
+RESET_PATTERN = re.compile(
+    r"resets\s+([0-9]{1,2})(?::([0-9]{2}))?\s*([ap]m)?(?:\s*\(([^)]+)\))?",
+    re.IGNORECASE,
+)
+
+
+def parse_args() -> argparse.Namespace:
+    parser = argparse.ArgumentParser(
+        description="Show a local Claude usage snapshot from Claude Code logs."
+    )
+    parser.add_argument(
+        "--claude-home",
+        default=os.environ.get("CLAUDE_HOME", "~/.claude"),
+        help="Path to the Claude home directory (default: ~/.claude).",
+    )
+    parser.add_argument(
+        "--json",
+        action="store_true",
+        dest="json_output",
+        help="Print the snapshot as JSON.",
+    )
+    parser.add_argument(
+        "--statusline-cache",
+        default=os.environ.get("CLAUDE_STATUSLINE_CACHE", "~/.claude/statusline-cache.json"),
+        help="Path to the Claude Code status line cache.",
+    )
+    return parser.parse_args()
+
+
+def resolve_path(raw_path: str) -> Path:
+    return Path(raw_path).expanduser().resolve()
+
+
+def parse_iso_timestamp(raw_timestamp: Any) -> datetime | None:
+    if not isinstance(raw_timestamp, str):
+        return None
+    try:
+        parsed = datetime.fromisoformat(raw_timestamp.replace("Z", "+00:00"))
+    except ValueError:
+        return None
+    if parsed.tzinfo is None:
+        return parsed.replace(tzinfo=LOCAL_TZ)
+    return parsed.astimezone(LOCAL_TZ)
+
+
+def format_datetime(raw_datetime: datetime | None) -> str | None:
+    if raw_datetime is None:
+        return None
+    return raw_datetime.astimezone().strftime("%Y-%m-%d %H:%M:%S %Z")
+
+
+def parse_epoch(raw_epoch: Any) -> datetime | None:
+    if not isinstance(raw_epoch, (int, float)) or raw_epoch <= 0:
+        return None
+    try:
+        return datetime.fromtimestamp(raw_epoch, tz=LOCAL_TZ)
+    except (OverflowError, OSError, ValueError):
+        return None
+
+
+def compact_number(value: int | float | None) -> str:
+    if value is None:
+        return "--"
+    value = int(value)
+    sign = "-" if value < 0 else ""
+    value = abs(value)
+    for suffix, divisor in (("B", 1_000_000_000), ("M", 1_000_000), ("K", 1_000)):
+        if value >= divisor:
+            return f"{sign}{value / divisor:.1f}{suffix}".replace(".0", "")
+    return f"{sign}{value}"
+
+
+def usage_tokens(usage: Any) -> int:
+    if not isinstance(usage, dict):
+        return 0
+    fields = (
+        "input_tokens",
+        "cache_creation_input_tokens",
+        "cache_read_input_tokens",
+        "output_tokens",
+    )
+    return sum(int(usage.get(field) or 0) for field in fields)
+
+
+def iter_jsonl_events(projects_root: Path):
+    if not projects_root.is_dir():
+        return
+
+    for path in sorted(
+        projects_root.rglob("*.jsonl"),
+        key=lambda candidate: candidate.stat().st_mtime,
+        reverse=True,
+    ):
+        try:
+            with path.open("r", encoding="utf-8", errors="replace") as handle:
+                for line in handle:
+                    line = line.strip()
+                    if not line:
+                        continue
+                    try:
+                        event = json.loads(line)
+                    except json.JSONDecodeError:
+                        continue
+                    if isinstance(event, dict):
+                        yield path, event
+        except OSError:
+            continue
+
+
+def content_text(message: Any) -> str:
+    if not isinstance(message, dict):
+        return ""
+    content = message.get("content")
+    if isinstance(content, str):
+        return content
+    if not isinstance(content, list):
+        return ""
+
+    parts: list[str] = []
+    for item in content:
+        if isinstance(item, dict) and isinstance(item.get("text"), str):
+            parts.append(item["text"])
+    return "\n".join(parts)
+
+
+def timezone_from_label(label: str | None):
+    if not label or ZoneInfo is None:
+        return LOCAL_TZ
+    try:
+        return ZoneInfo(label)
+    except Exception:  # noqa: BLE001
+        return LOCAL_TZ
+
+
+def parse_reset_label(text: str, event_time: datetime | None) -> datetime | None:
+    if event_time is None:
+        return None
+
+    match = RESET_PATTERN.search(text)
+    if not match:
+        return None
+
+    hour = int(match.group(1))
+    minute = int(match.group(2) or "0")
+    meridiem = (match.group(3) or "").lower()
+    tz = timezone_from_label(match.group(4))
+    base = event_time.astimezone(tz)
+
+    if meridiem:
+        if meridiem == "pm" and hour != 12:
+            hour += 12
+        if meridiem == "am" and hour == 12:
+            hour = 0
+
+    if hour > 23 or minute > 59:
+        return None
+
+    reset_at = base.replace(hour=hour, minute=minute, second=0, microsecond=0)
+    if reset_at <= base:
+        reset_at += timedelta(days=1)
+    return reset_at.astimezone(LOCAL_TZ)
+
+
+def read_subscription_label(claude_home: Path) -> str:
+    credentials = claude_home / ".credentials.json"
+    try:
+        payload = json.loads(credentials.read_text(encoding="utf-8"))
+    except (OSError, json.JSONDecodeError):
+        return "unknown"
+
+    oauth = payload.get("claudeAiOauth")
+    if not isinstance(oauth, dict):
+        return "unknown"
+
+    subscription = oauth.get("subscriptionType")
+    tier = oauth.get("rateLimitTier")
+    values = [value for value in (subscription, tier) if isinstance(value, str) and value]
+    return " / ".join(values) if values else "unknown"
+
+
+def read_statusline_cache(cache_file: Path) -> dict[str, Any] | None:
+    try:
+        payload = json.loads(cache_file.read_text(encoding="utf-8"))
+    except (OSError, json.JSONDecodeError):
+        return None
+    return payload if isinstance(payload, dict) else None
+
+
+def limit_window_from_cache(
+    rate_limits: dict[str, Any],
+    key: str,
+    label: str,
+    now: datetime,
+) -> dict[str, Any] | None:
+    raw_window = rate_limits.get(key)
+    if not isinstance(raw_window, dict):
+        return None
+
+    raw_percent = raw_window.get("used_percentage")
+    if not isinstance(raw_percent, (int, float)):
+        return None
+
+    percent = max(0.0, min(100.0, float(raw_percent)))
+    reset_at = parse_epoch(raw_window.get("resets_at"))
+    if reset_at is not None and reset_at <= now:
+        return None
+
+    return {
+        "window_label": label,
+        "used_percent": percent,
+        "used_label": f"{round(percent)}%",
+        "resets_at_epoch": int(reset_at.timestamp()) if reset_at else None,
+        "resets_at_local": format_datetime(reset_at),
+    }
+
+
+def cached_limits_snapshot(
+    claude_home: Path,
+    cache_file: Path,
+    latest_model: str,
+    latest_turn_tokens: int,
+    daily_tokens: int,
+) -> dict[str, Any] | None:
+    payload = read_statusline_cache(cache_file)
+    if not payload:
+        return None
+
+    rate_limits = payload.get("rate_limits")
+    if not isinstance(rate_limits, dict):
+        return None
+
+    now = datetime.now().astimezone()
+    five_hour = limit_window_from_cache(rate_limits, "five_hour", "5h", now)
+    seven_day = limit_window_from_cache(rate_limits, "seven_day", "7d", now)
+    if not five_hour and not seven_day:
+        return None
+
+    captured_at = payload.get("captured_at_local")
+    model = payload.get("model")
+    if isinstance(model, dict) and isinstance(model.get("display_name"), str):
+        latest_model = model["display_name"]
+
+    token_window = {
+        "window_label": "24h",
+        "used_percent": None,
+        "used_label": compact_number(daily_tokens),
+        "resets_at_epoch": None,
+        "resets_at_local": None,
+    }
+
+    return {
+        "provider": "claude",
+        "provider_label": "Claude",
+        "provider_short_label": "CLD",
+        "source": str(cache_file),
+        "snapshot_at_local": format_datetime(now),
+        "plan_type": read_subscription_label(claude_home),
+        "primary": five_hour or seven_day,
+        "secondary": seven_day if five_hour and seven_day else token_window,
+        "details": [
+            f"Latest model: {latest_model}",
+            f"Latest turn tokens: {compact_number(latest_turn_tokens)}",
+            f"24h local tokens: {compact_number(daily_tokens)}",
+            f"Rate limit source: Claude Code statusLine cache at {captured_at or 'unknown time'}.",
+        ],
+    }
+
+
+def find_snapshot(claude_home: Path, statusline_cache: Path) -> dict[str, Any]:
+    projects_root = claude_home / "projects"
+    now = datetime.now().astimezone()
+    cutoff = now - timedelta(hours=24)
+    daily_tokens = 0
+    latest_usage_time: datetime | None = None
+    latest_usage: dict[str, Any] | None = None
+    latest_model = "unknown"
+    latest_source: Path | None = None
+    latest_limit_time: datetime | None = None
+    latest_limit_reset: datetime | None = None
+
+    for path, event in iter_jsonl_events(projects_root) or []:
+        timestamp = parse_iso_timestamp(event.get("timestamp"))
+        message = event.get("message")
+
+        if event.get("type") == "assistant" and isinstance(message, dict):
+            usage = message.get("usage")
+            turn_tokens = usage_tokens(usage)
+            if timestamp and timestamp >= cutoff:
+                daily_tokens += turn_tokens
+            if turn_tokens > 0 and (
+                latest_usage_time is None or (timestamp and timestamp > latest_usage_time)
+            ):
+                latest_usage_time = timestamp
+                latest_usage = usage
+                latest_model = str(message.get("model") or "unknown")
+                latest_source = path
+
+        is_limit = (
+            event.get("error") == "rate_limit"
+            or event.get("apiErrorStatus") == 429
+            or event.get("isApiErrorMessage") is True
+        )
+        if is_limit:
+            reset_at = parse_reset_label(content_text(message), timestamp)
+            if latest_limit_time is None or (timestamp and timestamp > latest_limit_time):
+                latest_limit_time = timestamp
+                latest_limit_reset = reset_at
+
+    active_limit = bool(latest_limit_reset and latest_limit_reset > now)
+    reset_epoch = int(latest_limit_reset.timestamp()) if active_limit else None
+    latest_turn_tokens = usage_tokens(latest_usage)
+
+    cached_snapshot = cached_limits_snapshot(
+        claude_home,
+        statusline_cache,
+        latest_model,
+        latest_turn_tokens,
+        daily_tokens,
+    )
+    if cached_snapshot:
+        return cached_snapshot
+
+    return {
+        "provider": "claude",
+        "provider_label": "Claude",
+        "provider_short_label": "CLD",
+        "source": str(latest_source) if latest_source else None,
+        "snapshot_at_local": format_datetime(now),
+        "plan_type": read_subscription_label(claude_home),
+        "primary": {
+            "window_label": "5h",
+            "used_percent": 100 if active_limit else None,
+            "used_label": "hit" if active_limit else "--",
+            "resets_at_epoch": reset_epoch,
+            "resets_at_local": format_datetime(latest_limit_reset) if active_limit else None,
+        },
+        "secondary": {
+            "window_label": "24h",
+            "used_percent": None,
+            "used_label": compact_number(daily_tokens),
+            "resets_at_epoch": None,
+            "resets_at_local": None,
+        },
+        "details": [
+            f"Latest model: {latest_model}",
+            f"Latest turn tokens: {compact_number(latest_turn_tokens)}",
+            f"24h local tokens: {compact_number(daily_tokens)}",
+            (
+                "Quota percent: waiting for Claude Code statusLine cache; only active "
+                "429 limit state is reported until then."
+            ),
+        ],
+    }
+
+
+def print_human(snapshot: dict[str, Any]) -> None:
+    print("Claude usage snapshot")
+    print(f"Plan: {snapshot.get('plan_type') or 'unknown'}")
+    print(f"Snapshot: {snapshot.get('snapshot_at_local') or 'unknown'}")
+    for key in ("primary", "secondary"):
+        window = snapshot.get(key)
+        if isinstance(window, dict):
+            print(
+                f"{window.get('window_label') or key}: "
+                f"{window.get('used_label') or '--'}"
+            )
+
+
+def main() -> int:
+    args = parse_args()
+    claude_home = resolve_path(args.claude_home)
+    statusline_cache = resolve_path(args.statusline_cache)
+
+    try:
+        snapshot = find_snapshot(claude_home, statusline_cache)
+    except Exception as error:  # noqa: BLE001
+        print(f"Error: {error}", file=sys.stderr)
+        return 1
+
+    if args.json_output:
+        print(json.dumps(snapshot, indent=2))
+        return 0
+
+    print_human(snapshot)
+    return 0
+
+
+if __name__ == "__main__":
+    raise SystemExit(main())
