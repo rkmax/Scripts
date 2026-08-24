@@ -5,6 +5,9 @@ set -Eeuo pipefail
 readonly APP_NAME="Markdown to Slack"
 readonly NOTIFICATION_ID="84721"
 
+SCRIPT_DIR="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd)"
+readonly SPACING_FILTER="$SCRIPT_DIR/markdown-to-slack-spacing.lua"
+
 notify() {
   local urgency="$1"
   local icon="$2"
@@ -53,7 +56,8 @@ html="$(
     --from=gfm-raw_html \
     --to=html5 \
     --wrap=none \
-    --no-highlight
+    --no-highlight \
+    --lua-filter="$SPACING_FILTER"
 )" || fail "Could not render the Markdown."
 
 [[ -n "$html" ]] || fail "The rendered HTML is empty."
