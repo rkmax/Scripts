@@ -3,10 +3,13 @@
 from __future__ import annotations
 
 import argparse
+import hashlib
 import json
 import os
 import re
 import sys
+import urllib.error
+import urllib.request
 from datetime import datetime, timedelta
 from pathlib import Path
 from typing import Any
@@ -22,6 +25,28 @@ RESET_PATTERN = re.compile(
     r"resets\s+([0-9]{1,2})(?::([0-9]{2}))?\s*([ap]m)?(?:\s*\(([^)]+)\))?",
     re.IGNORECASE,
 )
+
+# The statusLine payload only ever carries `five_hour` and `seven_day`; the
+# per-model windows (Fable above all, which bills against its own quota) come
+# from the same endpoint the `/usage` dialog reads. Claude Code caches that
+# response in its own config store, but only after a `/usage` fetch runs, so a
+# poller that wants the Fable number has to ask for it.
+USAGE_URL = os.environ.get(
+    "CLAUDE_USAGE_URL", "https://api.anthropic.com/api/oauth/usage"
+)
+USAGE_BETA = "oauth-2025-04-20"
+USAGE_AGENT = "claude-cli/2.1.247 (external, cli)"
+USAGE_TIMEOUT_SECONDS = 5
+# The endpoint answers a 429 with `retry-after` measured in tens of minutes, so
+# it is not pollable. An hour is the same validity Claude Code gives its own
+# copy of this payload, and a weekly per-model window does not move faster.
+USAGE_CACHE_TTL_SECONDS = 3600
+USAGE_BACKOFF_SECONDS = 3600
+
+# Both sources report 0-100: `used_percentage` in the statusLine cache,
+# `utilization` and `limits[].percent` from the usage endpoint.
+GENERAL_WINDOWS = (("five_hour", "5h"), ("seven_day", "7d"))
+MODEL_WINDOWS = (("seven_day_opus", "opus"), ("seven_day_sonnet", "sonnet"))
 
 
 def parse_args() -> argparse.Namespace:
@@ -41,8 +66,9 @@ def parse_args() -> argparse.Namespace:
     )
     parser.add_argument(
         "--statusline-cache",
-        default=os.environ.get("CLAUDE_STATUSLINE_CACHE", "~/.claude/statusline-cache.json"),
-        help="Path to the Claude Code status line cache.",
+        default=os.environ.get("CLAUDE_STATUSLINE_CACHE", ""),
+        help="Path to the Claude Code status line cache "
+        "(default: statusline-cache.json inside --claude-home).",
     )
     return parser.parse_args()
 
@@ -102,15 +128,21 @@ def usage_tokens(usage: Any) -> int:
     return sum(int(usage.get(field) or 0) for field in fields)
 
 
-def iter_jsonl_events(projects_root: Path):
+def iter_jsonl_events(projects_root: Path, cutoff: datetime):
     if not projects_root.is_dir():
         return
 
+    cutoff_epoch = cutoff.timestamp()
     for path in sorted(
         projects_root.rglob("*.jsonl"),
         key=lambda candidate: candidate.stat().st_mtime,
         reverse=True,
     ):
+        # Newest first, so the first file untouched since the cutoff ends the
+        # walk: nothing older can hold an event inside the window, and reading
+        # the whole transcript archive on a 60 s poll is not free.
+        if path.stat().st_mtime < cutoff_epoch:
+            return
         try:
             with path.open("r", encoding="utf-8", errors="replace") as handle:
                 for line in handle:
@@ -234,147 +266,435 @@ def limit_window_from_cache(
     }
 
 
-def cached_limits_snapshot(
-    claude_home: Path,
-    cache_file: Path,
-    latest_model: str,
-    latest_turn_tokens: int,
-    daily_tokens: int,
-) -> dict[str, Any] | None:
-    payload = read_statusline_cache(cache_file)
-    if not payload:
+def account_name(claude_home: Path) -> str:
+    """`~/.claude` is the personal account, `~/.claude-work` the work one.
+
+    Same rule Claude Code's own status line uses to label a config directory.
+    """
+    return claude_home.name.removeprefix(".claude").lstrip("-") or "personal"
+
+
+def provider_identity(account: str) -> tuple[str, str, str]:
+    if account == "personal":
+        return "claude", "Claude", "CLD"
+    return f"claude-{account}", f"Claude ({account})", f"CL{account[0].upper()}"
+
+
+def read_access_token(claude_home: Path) -> str | None:
+    """The live OAuth token, or None when it is missing or already expired.
+
+    Refreshing is Claude Code's job: a poller that rotated the token behind a
+    running session would invalidate the session's own copy.
+    """
+    credentials = claude_home / ".credentials.json"
+    try:
+        payload = json.loads(credentials.read_text(encoding="utf-8"))
+    except (OSError, json.JSONDecodeError):
         return None
 
-    rate_limits = payload.get("rate_limits")
-    if not isinstance(rate_limits, dict):
+    oauth = payload.get("claudeAiOauth")
+    if not isinstance(oauth, dict):
         return None
 
-    now = datetime.now().astimezone()
-    five_hour = limit_window_from_cache(rate_limits, "five_hour", "5h", now)
-    seven_day = limit_window_from_cache(rate_limits, "seven_day", "7d", now)
-    if not five_hour and not seven_day:
+    token = oauth.get("accessToken")
+    if not isinstance(token, str) or not token:
         return None
 
-    captured_at = payload.get("captured_at_local")
-    model = payload.get("model")
-    if isinstance(model, dict) and isinstance(model.get("display_name"), str):
-        latest_model = model["display_name"]
+    expires_at = oauth.get("expiresAt")
+    if isinstance(expires_at, (int, float)):
+        if expires_at / 1000 <= datetime.now().timestamp():
+            return None
+    return token
 
-    token_window = {
-        "window_label": "24h",
-        "used_percent": None,
-        "used_label": compact_number(daily_tokens),
-        "resets_at_epoch": None,
-        "resets_at_local": None,
-    }
 
+def usage_cache_file(claude_home: Path, account: str) -> Path:
+    # Keyed by the home it was fetched for, not just by its label: two homes can
+    # share a directory name, and one account's quota must never be read as the
+    # other's.
+    base = os.environ.get("XDG_CACHE_HOME") or "~/.cache"
+    digest = hashlib.sha256(str(claude_home).encode("utf-8")).hexdigest()[:8]
+    return Path(base).expanduser() / "claude-status" / f"{account}-{digest}.json"
+
+
+def read_usage_cache(cache_file: Path) -> dict[str, Any] | None:
+    try:
+        payload = json.loads(cache_file.read_text(encoding="utf-8"))
+    except (OSError, json.JSONDecodeError):
+        return None
+    return payload if isinstance(payload, dict) else None
+
+
+def write_usage_cache(cache_file: Path, payload: dict[str, Any]) -> None:
+    try:
+        cache_file.parent.mkdir(parents=True, exist_ok=True)
+        tmp_path = cache_file.with_suffix(".json.tmp")
+        tmp_path.write_text(json.dumps(payload, indent=2) + "\n", encoding="utf-8")
+        tmp_path.replace(cache_file)
+    except OSError:
+        pass
+
+
+def fetch_usage(token: str) -> tuple[dict[str, Any] | None, int]:
+    """The usage payload, plus how many seconds to wait before asking again."""
+    request = urllib.request.Request(
+        USAGE_URL,
+        headers={
+            "Authorization": f"Bearer {token}",
+            "anthropic-beta": USAGE_BETA,
+            "User-Agent": USAGE_AGENT,
+            "Accept": "application/json",
+        },
+    )
+    try:
+        with urllib.request.urlopen(request, timeout=USAGE_TIMEOUT_SECONDS) as response:
+            payload = json.loads(response.read().decode("utf-8"))
+    except urllib.error.HTTPError as error:
+        # A 429 names its own cooldown; ignoring it is how a poller earns a
+        # longer one.
+        raw_retry = error.headers.get("Retry-After") if error.headers else None
+        try:
+            retry_after = int(raw_retry)
+        except (TypeError, ValueError):
+            retry_after = USAGE_BACKOFF_SECONDS
+        return None, max(retry_after, USAGE_BACKOFF_SECONDS)
+    except (urllib.error.URLError, TimeoutError, ValueError, OSError):
+        return None, USAGE_BACKOFF_SECONDS
+    if not isinstance(payload, dict):
+        return None, USAGE_BACKOFF_SECONDS
+    return payload, 0
+
+
+def load_usage(claude_home: Path, account: str) -> tuple[dict[str, Any] | None, str]:
+    """The usage payload plus a one-line provenance for the tooltip.
+
+    A stale cache beats nothing: when the token has expired or the request
+    fails, the last good answer is still the best available reading, and the
+    provenance says how old it is.
+    """
+    cache_file = usage_cache_file(claude_home, account)
+    cached = read_usage_cache(cache_file) or {}
+    now = datetime.now().timestamp()
+
+    fetched_at = cached.get("fetched_at_epoch")
+    fresh = (
+        isinstance(fetched_at, (int, float))
+        and now - fetched_at < USAGE_CACHE_TTL_SECONDS
+    )
+    if cached.get("usage") and fresh:
+        return cached["usage"], f"usage endpoint at {cached.get('fetched_at_local')}"
+
+    retry_after = cached.get("retry_after_epoch")
+    cooling = isinstance(retry_after, (int, float)) and now < retry_after
+    token = None if cooling else read_access_token(claude_home)
+
+    if token:
+        usage, backoff = fetch_usage(token)
+        if usage is not None:
+            fetched_local = format_datetime(datetime.now().astimezone())
+            write_usage_cache(
+                cache_file,
+                {
+                    "fetched_at_epoch": int(now),
+                    "fetched_at_local": fetched_local,
+                    "usage": usage,
+                },
+            )
+            return usage, f"usage endpoint at {fetched_local}"
+        write_usage_cache(
+            cache_file,
+            {**cached, "retry_after_epoch": int(now + backoff)},
+        )
+
+    if cooling:
+        reason = "endpoint cooling down"
+    elif not token:
+        reason = "no usable OAuth token"
+    else:
+        reason = "usage endpoint unreachable"
+
+    if cached.get("usage"):
+        return cached["usage"], (
+            f"usage endpoint at {cached.get('fetched_at_local')} (stale, {reason})"
+        )
+    return None, reason
+
+
+def to_percent(raw_value: Any) -> float | None:
+    if not isinstance(raw_value, (int, float)):
+        return None
+    return max(0.0, min(100.0, float(raw_value)))
+
+
+def reset_datetime(raw_value: Any) -> datetime | None:
+    if isinstance(raw_value, str):
+        return parse_iso_timestamp(raw_value)
+    return parse_epoch(raw_value)
+
+
+def build_window(label: str, percent: float | None, reset_at: datetime | None) -> dict[str, Any] | None:
+    if percent is None:
+        return None
     return {
-        "provider": "claude",
-        "provider_label": "Claude",
-        "provider_short_label": "CLD",
-        "source": str(cache_file),
-        "snapshot_at_local": format_datetime(now),
-        "plan_type": read_subscription_label(claude_home),
-        "primary": five_hour or seven_day,
-        "secondary": seven_day if five_hour and seven_day else token_window,
-        "details": [
-            f"Latest model: {latest_model}",
-            f"Latest turn tokens: {compact_number(latest_turn_tokens)}",
-            f"24h local tokens: {compact_number(daily_tokens)}",
-            f"Rate limit source: Claude Code statusLine cache at {captured_at or 'unknown time'}.",
-        ],
+        "window_label": label,
+        "used_percent": percent,
+        "used_label": f"{round(percent)}%",
+        "resets_at_epoch": int(reset_at.timestamp()) if reset_at else None,
+        "resets_at_local": format_datetime(reset_at),
     }
 
 
-def find_snapshot(claude_home: Path, statusline_cache: Path) -> dict[str, Any]:
-    projects_root = claude_home / "projects"
-    now = datetime.now().astimezone()
-    cutoff = now - timedelta(hours=24)
-    daily_tokens = 0
-    latest_usage_time: datetime | None = None
-    latest_usage: dict[str, Any] | None = None
-    latest_model = "unknown"
-    latest_source: Path | None = None
-    latest_limit_time: datetime | None = None
-    latest_limit_reset: datetime | None = None
+def window_from_usage(
+    windows: dict[str, Any],
+    key: str,
+    label: str,
+    now: datetime,
+) -> dict[str, Any] | None:
+    entry = windows.get(key)
+    if not isinstance(entry, dict):
+        return None
+    reset_at = reset_datetime(entry.get("resets_at"))
+    if reset_at is not None and reset_at <= now:
+        return None
+    return build_window(label, to_percent(entry.get("utilization")), reset_at)
 
-    for path, event in iter_jsonl_events(projects_root) or []:
+
+def model_windows_from_usage(usage: dict[str, Any], now: datetime) -> list[dict[str, Any]]:
+    """The per-model weekly windows the server sends as a `limits[]` array.
+
+    Fable is the one that matters here: it bills against a quota of its own, so
+    the shared window says nothing about how much of it is left.
+    """
+    raw_limits = usage.get("limits")
+    if not isinstance(raw_limits, list):
+        return []
+
+    windows: list[dict[str, Any]] = []
+    for entry in raw_limits:
+        if not isinstance(entry, dict):
+            continue
+        scope = entry.get("scope")
+        model = scope.get("model") if isinstance(scope, dict) else None
+        display_name = model.get("display_name") if isinstance(model, dict) else None
+        if not isinstance(display_name, str) or not display_name:
+            continue
+        reset_at = reset_datetime(entry.get("resets_at"))
+        if reset_at is not None and reset_at <= now:
+            continue
+        window = build_window(
+            display_name.split()[0].lower(),
+            to_percent(entry.get("percent")),
+            reset_at,
+        )
+        if window:
+            windows.append(window)
+    return windows
+
+
+def transcript_totals(projects_root: Path, now: datetime) -> dict[str, Any]:
+    """Token counts and the most recent 429, from this machine's transcripts.
+
+    Only files touched inside the window can hold events inside it, and the
+    walk is newest-first, so it stops at the first older file instead of
+    reading every transcript ever written on every poll.
+    """
+    cutoff = now - timedelta(hours=24)
+    totals = {
+        "daily_tokens": 0,
+        "latest_turn_tokens": 0,
+        "latest_model": "unknown",
+        "source": None,
+        "limit_reset": None,
+    }
+    latest_usage_time: datetime | None = None
+    latest_limit_time: datetime | None = None
+
+    for path, event in iter_jsonl_events(projects_root, cutoff):
         timestamp = parse_iso_timestamp(event.get("timestamp"))
         message = event.get("message")
 
         if event.get("type") == "assistant" and isinstance(message, dict):
-            usage = message.get("usage")
-            turn_tokens = usage_tokens(usage)
+            turn_tokens = usage_tokens(message.get("usage"))
             if timestamp and timestamp >= cutoff:
-                daily_tokens += turn_tokens
+                totals["daily_tokens"] += turn_tokens
             if turn_tokens > 0 and (
                 latest_usage_time is None or (timestamp and timestamp > latest_usage_time)
             ):
                 latest_usage_time = timestamp
-                latest_usage = usage
-                latest_model = str(message.get("model") or "unknown")
-                latest_source = path
+                totals["latest_turn_tokens"] = turn_tokens
+                totals["latest_model"] = str(message.get("model") or "unknown")
+                totals["source"] = path
 
         is_limit = (
             event.get("error") == "rate_limit"
             or event.get("apiErrorStatus") == 429
             or event.get("isApiErrorMessage") is True
         )
-        if is_limit:
-            reset_at = parse_reset_label(content_text(message), timestamp)
-            if latest_limit_time is None or (timestamp and timestamp > latest_limit_time):
-                latest_limit_time = timestamp
-                latest_limit_reset = reset_at
+        if is_limit and (
+            latest_limit_time is None or (timestamp and timestamp > latest_limit_time)
+        ):
+            latest_limit_time = timestamp
+            totals["limit_reset"] = parse_reset_label(content_text(message), timestamp)
 
-    active_limit = bool(latest_limit_reset and latest_limit_reset > now)
-    reset_epoch = int(latest_limit_reset.timestamp()) if active_limit else None
-    latest_turn_tokens = usage_tokens(latest_usage)
+    return totals
 
-    cached_snapshot = cached_limits_snapshot(
-        claude_home,
-        statusline_cache,
-        latest_model,
-        latest_turn_tokens,
-        daily_tokens,
+
+def general_windows(
+    usage: dict[str, Any] | None,
+    rate_limits: dict[str, Any] | None,
+    now: datetime,
+) -> list[dict[str, Any]]:
+    """The windows every model shares, newest source first.
+
+    The endpoint answers for the account; the status line cache only answers
+    for whatever session last wrote it, so it is the fallback, not the source.
+    """
+    windows = []
+    for key, label in GENERAL_WINDOWS:
+        window = None
+        if usage:
+            window = window_from_usage(usage, key, label, now)
+        if window is None and rate_limits:
+            window = limit_window_from_cache(rate_limits, key, label, now)
+        if window:
+            windows.append(window)
+    return windows
+
+
+def usage_snapshot(
+    claude_home: Path,
+    cache_file: Path,
+    now: datetime,
+) -> dict[str, Any] | None:
+    account = account_name(claude_home)
+    provider, provider_label, provider_short = provider_identity(account)
+    usage, usage_source = load_usage(claude_home, account)
+
+    cached = read_statusline_cache(cache_file) or {}
+    rate_limits = cached.get("rate_limits")
+    if not isinstance(rate_limits, dict):
+        rate_limits = None
+
+    shared = general_windows(usage, rate_limits, now)
+    if not shared:
+        return None
+
+    # The chip has room for one shared reading; the one closest to its ceiling
+    # is the one that decides when work stops.
+    primary = max(shared, key=lambda window: window["used_percent"])
+
+    model_scoped = model_windows_from_usage(usage, now) if usage else []
+    fable = next(
+        (window for window in model_scoped if window["window_label"].startswith("fable")),
+        None,
     )
-    if cached_snapshot:
-        return cached_snapshot
+
+    details = []
+    for window in shared:
+        if window is not primary:
+            details.append(
+                f"{window['window_label']}: {window['used_label']} used, "
+                f"resets {window['resets_at_local'] or 'unknown'}"
+            )
+    if usage:
+        for key, label in MODEL_WINDOWS:
+            window = window_from_usage(usage, key, label, now)
+            if window:
+                details.append(
+                    f"{label}: {window['used_label']} used, "
+                    f"resets {window['resets_at_local'] or 'unknown'}"
+                )
+    for window in model_scoped:
+        if window is not fable:
+            details.append(
+                f"{window['window_label']}: {window['used_label']} used, "
+                f"resets {window['resets_at_local'] or 'unknown'}"
+            )
+
+    extra_usage = usage.get("extra_usage") if usage else None
+    if isinstance(extra_usage, dict) and extra_usage.get("is_enabled"):
+        used = extra_usage.get("used_credits")
+        limit = extra_usage.get("monthly_limit")
+        currency = extra_usage.get("currency") or ""
+        details.append(f"Extra usage: {used} / {limit} {currency}".strip())
+
+    model = cached.get("model")
+    if isinstance(model, dict) and isinstance(model.get("display_name"), str):
+        details.append(f"Latest model: {model['display_name']}")
+    details.append(f"Account: {account}")
+    details.append(f"Limit source: {usage_source}.")
+    if not usage:
+        details.append("Per-model quotas need the usage endpoint.")
 
     return {
-        "provider": "claude",
-        "provider_label": "Claude",
-        "provider_short_label": "CLD",
-        "source": str(latest_source) if latest_source else None,
+        "provider": provider,
+        "provider_label": provider_label,
+        "provider_short_label": provider_short,
+        "account": account,
+        "source": USAGE_URL if usage else str(cache_file),
+        "snapshot_at_local": format_datetime(now),
+        "plan_type": read_subscription_label(claude_home),
+        "primary": primary,
+        "secondary": fable,
+        "details": details,
+    }
+
+
+def transcript_snapshot(
+    claude_home: Path,
+    account: str,
+    now: datetime,
+) -> dict[str, Any]:
+    """Last resort: no endpoint, no status line cache, only local transcripts.
+
+    It can report an active 429 and how many tokens went out today, which is
+    strictly less than a quota window but better than an empty chip.
+    """
+    provider, provider_label, provider_short = provider_identity(account)
+    totals = transcript_totals(claude_home / "projects", now)
+
+    limit_reset = totals["limit_reset"]
+    active_limit = bool(limit_reset and limit_reset > now)
+
+    return {
+        "provider": provider,
+        "provider_label": provider_label,
+        "provider_short_label": provider_short,
+        "account": account,
+        "source": str(totals["source"]) if totals["source"] else None,
         "snapshot_at_local": format_datetime(now),
         "plan_type": read_subscription_label(claude_home),
         "primary": {
             "window_label": "5h",
             "used_percent": 100 if active_limit else None,
             "used_label": "hit" if active_limit else "--",
-            "resets_at_epoch": reset_epoch,
-            "resets_at_local": format_datetime(latest_limit_reset) if active_limit else None,
+            "resets_at_epoch": int(limit_reset.timestamp()) if active_limit else None,
+            "resets_at_local": format_datetime(limit_reset) if active_limit else None,
         },
-        "secondary": {
-            "window_label": "24h",
-            "used_percent": None,
-            "used_label": compact_number(daily_tokens),
-            "resets_at_epoch": None,
-            "resets_at_local": None,
-        },
+        "secondary": None,
         "details": [
-            f"Latest model: {latest_model}",
-            f"Latest turn tokens: {compact_number(latest_turn_tokens)}",
-            f"24h local tokens: {compact_number(daily_tokens)}",
+            f"Account: {account}",
+            f"Latest model: {totals['latest_model']}",
+            f"Latest turn tokens: {compact_number(totals['latest_turn_tokens'])}",
+            f"24h local tokens: {compact_number(totals['daily_tokens'])}",
             (
-                "Quota percent: waiting for Claude Code statusLine cache; only active "
-                "429 limit state is reported until then."
+                "Quota percent unavailable: no usage endpoint answer and no "
+                "status line cache; only an active 429 is reported."
             ),
         ],
     }
 
 
+def find_snapshot(claude_home: Path, statusline_cache: Path) -> dict[str, Any]:
+    now = datetime.now().astimezone()
+    snapshot = usage_snapshot(claude_home, statusline_cache, now)
+    if snapshot:
+        return snapshot
+    return transcript_snapshot(claude_home, account_name(claude_home), now)
+
+
+
 def print_human(snapshot: dict[str, Any]) -> None:
-    print("Claude usage snapshot")
+    print(f"{snapshot.get('provider_label') or 'Claude'} usage snapshot")
     print(f"Plan: {snapshot.get('plan_type') or 'unknown'}")
     print(f"Snapshot: {snapshot.get('snapshot_at_local') or 'unknown'}")
     for key in ("primary", "secondary"):
@@ -384,12 +704,18 @@ def print_human(snapshot: dict[str, Any]) -> None:
                 f"{window.get('window_label') or key}: "
                 f"{window.get('used_label') or '--'}"
             )
+    for detail in snapshot.get("details") or []:
+        print(detail)
 
 
 def main() -> int:
     args = parse_args()
     claude_home = resolve_path(args.claude_home)
-    statusline_cache = resolve_path(args.statusline_cache)
+    statusline_cache = (
+        resolve_path(args.statusline_cache)
+        if args.statusline_cache
+        else claude_home / "statusline-cache.json"
+    )
 
     try:
         snapshot = find_snapshot(claude_home, statusline_cache)
