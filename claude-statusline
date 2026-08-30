@@ -40,12 +40,12 @@ def account_badge(label: str) -> str:
     return f"\x1b[48;5;{color}m\x1b[38;5;16m {label.upper()} \x1b[0m"
 
 
-def cache_path() -> Path:
-    raw_path = os.environ.get(
-        "CLAUDE_STATUSLINE_CACHE",
-        "~/.claude/statusline-cache.json",
-    )
-    return Path(raw_path).expanduser().resolve()
+def cache_path(payload: dict[str, Any]) -> Path:
+    raw_path = os.environ.get("CLAUDE_STATUSLINE_CACHE")
+    if raw_path:
+        return Path(raw_path).expanduser().resolve()
+    directory = config_dir(payload) or Path("~/.claude")
+    return (directory / "statusline-cache.json").expanduser().resolve()
 
 
 def read_payload() -> dict[str, Any]:
@@ -72,7 +72,7 @@ def write_cache(payload: dict[str, Any]) -> None:
     if not payload:
         return
 
-    output_path = cache_path()
+    output_path = cache_path(payload)
     snapshot = {
         "captured_at_epoch": int(datetime.now().astimezone().timestamp()),
         "captured_at_local": datetime.now().astimezone().strftime(
