@@ -122,9 +122,12 @@ gpt_start_async_request() {
 
     exec {GPT_REQUEST_FD}< <(
         export DENO_NO_UPDATE_CHECK=1
-        local response exit_code
-        response="$(cd "$HOME" && "$gpt_script" "$prompt" 2>&1)"
+        local response exit_code errfile
+        errfile="$(mktemp)"
+        response="$(cd "$HOME" && "$gpt_script" "$prompt" 2>"$errfile")"
         exit_code=$?
+        (( exit_code != 0 )) && response="$(<"$errfile")"
+        rm -f "$errfile"
         unset DENO_NO_UPDATE_CHECK
         printf '%s\n' "$response"
         printf '%s:%d\n' "$token" "$exit_code"
