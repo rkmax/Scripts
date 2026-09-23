@@ -1,0 +1,475 @@
+#!/usr/bin/env python3
+"""Keep Chrome Web Store extensions current in every ungoogled-chromium profile.
+
+ungoogled-chromium ships without Google's extension updater. This script reads the
+extensions installed in every profile under the Chromium user data dir, asks the
+Chrome Web Store for their current versions, downloads the CRX files and registers
+them as Chromium "external extensions" (<user-data-dir>/External Extensions/<id>.json).
+Chromium applies them the next time each profile starts: new extensions install right
+away, an extension that is already installed and in use gets a delayed install that
+completes when it goes idle or on the following start.
+
+`--apply` finishes that part without opening any window: with Chromium closed, it
+starts every profile in headless mode, once or twice as needed, until nothing staged
+is pending, then puts back the last-used profile bookkeeping in Local State.
+
+External extensions apply to every profile, so an extension installed in one profile
+ends up in all of them. Uninstalling it in a profile is remembered by Chromium and it
+does not come back there.
+
+Optional ignore list: ~/.config/uc-ext-sync/ignore, one extension id per line.
+"""
+
+import argparse
+import hashlib
+import json
+import os
+import shutil
+import subprocess
+import sys
+import time
+import urllib.parse
+import urllib.request
+import xml.etree.ElementTree as ET
+from pathlib import Path
+
+WEB_STORE_UPDATE_URL = "https://clients2.google.com/service/update2/crx"
+UPDATE_NS = {"g": "http://www.google.com/update2/response"}
+# Manifest locations to sync: 1 internal (user installed), 2 external pref (already
+# staged by this script or by the package), 6 external pref download (default apps).
+SYNC_LOCATIONS = {1, 2, 6}
+SKIPPED_PROFILE_DIRS = {"System Profile", "Guest Profile"}
+CRX_MAGIC = b"Cr24"
+
+DEFAULT_USER_DATA_DIR = Path.home() / ".config" / "chromium"
+DEFAULT_CACHE_DIR = Path.home() / ".local" / "share" / "uc-ext-sync"
+IGNORE_FILE = Path.home() / ".config" / "uc-ext-sync" / "ignore"
+
+CHROMIUM_BIN = shutil.which("chromium") or "/usr/bin/chromium"
+APPLY_WAIT_SECONDS = 25
+APPLY_EXIT_SECONDS = 30
+APPLY_MAX_PASSES = 3
+
+
+def log(message):
+    print(message, flush=True)
+
+
+def parse_version(text):
+    parts = []
+    for piece in str(text).split("."):
+        try:
+            parts.append(int(piece))
+        except ValueError:
+            parts.append(0)
+    return tuple(parts)
+
+
+def read_json(path):
+    with open(path, encoding="utf-8") as handle:
+        return json.load(handle)
+
+
+def write_json_atomic(path, payload, compact=False):
+    tmp = path.with_suffix(path.suffix + ".tmp")
+    with open(tmp, "w", encoding="utf-8") as handle:
+        if compact:
+            json.dump(payload, handle, separators=(",", ":"))
+        else:
+            json.dump(payload, handle, indent=2)
+            handle.write("\n")
+    os.replace(tmp, path)
+
+
+def chromium_version(user_data_dir):
+    try:
+        return (user_data_dir / "Last Version").read_text().strip() or "152.0.0.0"
+    except OSError:
+        return "152.0.0.0"
+
+
+def load_ignored_ids():
+    if not IGNORE_FILE.is_file():
+        return set()
+    ignored = set()
+    for line in IGNORE_FILE.read_text().splitlines():
+        line = line.split("#", 1)[0].strip()
+        if line:
+            ignored.add(line)
+    return ignored
+
+
+def profile_dirs(user_data_dir):
+    return [
+        path
+        for path in sorted(user_data_dir.iterdir())
+        if path.name not in SKIPPED_PROFILE_DIRS and (path / "Preferences").is_file()
+    ]
+
+
+def read_profile_prefs(profile_dir):
+    """Return (extension settings, ids the user uninstalled as external extensions)."""
+    settings = {}
+    uninstalled = set()
+    for name in ("Preferences", "Secure Preferences"):
+        prefs_file = profile_dir / name
+        if not prefs_file.is_file():
+            continue
+        try:
+            extensions = read_json(prefs_file).get("extensions", {})
+        except (OSError, json.JSONDecodeError) as error:
+            log(f"warning: cannot read {prefs_file}: {error}")
+            continue
+        settings.update(extensions.get("settings", {}))
+        uninstalled.update(extensions.get("external_uninstalls", []))
+    return settings, uninstalled
+
+
+def discover_extensions(user_data_dir):
+    """Return {extension_id: {"name": str, "profiles": {profile_dir: version}}}."""
+    found = {}
+    for profile_dir in profile_dirs(user_data_dir):
+        settings, _ = read_profile_prefs(profile_dir)
+        for ext_id, entry in settings.items():
+            if not isinstance(entry, dict) or entry.get("location") not in SYNC_LOCATIONS:
+                continue
+            manifest = entry.get("manifest") or {}
+            if not str(manifest.get("update_url", "")).startswith(WEB_STORE_UPDATE_URL):
+                continue
+            record = found.setdefault(ext_id, {"name": manifest.get("name") or ext_id, "profiles": {}})
+            record["profiles"][profile_dir.name] = manifest.get("version") or "0"
+    return found
+
+
+def fetch(url, prodversion):
+    request = urllib.request.Request(
+        url,
+        headers={
+            "User-Agent": (
+                "Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 (KHTML, like Gecko) "
+                f"Chrome/{prodversion} Safari/537.36"
+            )
+        },
+    )
+    with urllib.request.urlopen(request, timeout=60) as response:
+        return response.read()
+
+
+def query_store(ext_ids, prodversion):
+    """Return {extension_id: {"version", "codebase", "sha256"}} for ids the store serves."""
+    query = "&".join("x=" + urllib.parse.quote(f"id={ext_id}&uc") for ext_id in ext_ids)
+    url = f"{WEB_STORE_UPDATE_URL}?response=updatecheck&acceptformat=crx3&prodversion={prodversion}&{query}"
+    root = ET.fromstring(fetch(url, prodversion))
+    served = {}
+    for app in root.findall("g:app", UPDATE_NS):
+        check = app.find("g:updatecheck", UPDATE_NS)
+        if check is None or check.get("status") != "ok" or not check.get("version") or not check.get("codebase"):
+            continue
+        served[app.get("appid")] = {
+            "version": check.get("version"),
+            "codebase": check.get("codebase"),
+            "sha256": check.get("hash_sha256"),
+        }
+    return served
+
+
+def download_crx(store_entry, target, prodversion):
+    data = fetch(store_entry["codebase"], prodversion)
+    if not data.startswith(CRX_MAGIC):
+        raise ValueError("downloaded file is not a CRX")
+    expected = store_entry.get("sha256")
+    if expected and hashlib.sha256(data).hexdigest() != expected:
+        raise ValueError("sha256 mismatch")
+    tmp = target.with_suffix(".part")
+    tmp.write_bytes(data)
+    os.replace(tmp, target)
+
+
+def staged_version(json_path):
+    if not json_path.is_file():
+        return None
+    try:
+        entry = read_json(json_path)
+    except (OSError, json.JSONDecodeError):
+        return None
+    if Path(str(entry.get("external_crx", ""))).is_file():
+        return entry.get("external_version")
+    return None
+
+
+def staged_entries(ext_dir):
+    """Return {extension_id: version} for every usable entry in External Extensions."""
+    staged = {}
+    if not ext_dir.is_dir():
+        return staged
+    for json_path in sorted(ext_dir.glob("*.json")):
+        version = staged_version(json_path)
+        if version:
+            staged[json_path.stem] = version
+    return staged
+
+
+def remove_stale_crx(cache_dir, ext_id, keep):
+    for old in cache_dir.glob(f"{ext_id}-*.crx"):
+        if old != keep:
+            old.unlink(missing_ok=True)
+
+
+def remove_orphans(ext_dir, cache_dir, known_ids, dry_run):
+    """Drop entries this script created for extensions no profile has any more."""
+    for json_path in sorted(ext_dir.glob("*.json")):
+        ext_id = json_path.stem
+        if ext_id in known_ids:
+            continue
+        try:
+            crx_path = Path(str(read_json(json_path).get("external_crx", "")))
+        except (OSError, json.JSONDecodeError):
+            continue
+        if crx_path.parent != cache_dir:
+            continue
+        log(f"{ext_id}: not installed in any profile, {'would remove' if dry_run else 'removing'} entry")
+        if not dry_run:
+            json_path.unlink(missing_ok=True)
+            remove_stale_crx(cache_dir, ext_id, keep=None)
+
+
+def notify(staged):
+    if not staged or not shutil.which("notify-send"):
+        return
+    names = ", ".join(f"{name} {version}" for name, version in staged)
+    subprocess.run(
+        [
+            "notify-send",
+            "--app-name=uc-ext-sync",
+            f"{len(staged)} extension update(s) staged",
+            f"Applied when each Chromium profile restarts, or run: uc-ext-sync --apply. {names}",
+        ],
+        check=False,
+    )
+
+
+def stage(args, user_data_dir, ext_dir, cache_dir):
+    """Download what the Web Store serves and write the External Extensions entries.
+
+    Returns (staged list, failure count, store reachable)."""
+    prodversion = chromium_version(user_data_dir)
+    ignored = load_ignored_ids()
+    extensions = discover_extensions(user_data_dir)
+    wanted = {
+        ext_id: info
+        for ext_id, info in extensions.items()
+        if ext_id not in ignored and (not args.only or ext_id in args.only)
+    }
+    if not wanted:
+        log("nothing to sync")
+        return [], 0, True
+
+    try:
+        served = query_store(sorted(wanted), prodversion)
+    except Exception as error:  # network or parse failure: report and let the timer retry
+        log(f"error: Web Store update check failed: {error}")
+        return [], 0, False
+
+    if not args.dry_run:
+        ext_dir.mkdir(parents=True, exist_ok=True)
+        cache_dir.mkdir(parents=True, exist_ok=True)
+
+    staged = []
+    failures = 0
+    for ext_id in sorted(wanted, key=lambda i: wanted[i]["name"].lower()):
+        info = wanted[ext_id]
+        name = info["name"]
+        entry = served.get(ext_id)
+        if entry is None:
+            log(f"{name} ({ext_id}): not served by the Web Store, skipped")
+            continue
+        version = entry["version"]
+        behind = [
+            f"{profile} {installed}"
+            for profile, installed in sorted(info["profiles"].items())
+            if parse_version(installed) < parse_version(version)
+        ]
+        status = f"behind in {', '.join(behind)}" if behind else "current in every profile that has it"
+        json_path = ext_dir / f"{ext_id}.json"
+        crx_path = cache_dir / f"{ext_id}-{version}.crx"
+        if staged_version(json_path) == version:
+            log(f"{name}: {version} already staged; {status}")
+            continue
+        if args.dry_run:
+            log(f"{name}: would stage {version}; {status}")
+            continue
+        try:
+            if not crx_path.is_file():
+                download_crx(entry, crx_path, prodversion)
+            write_json_atomic(json_path, {"external_crx": str(crx_path), "external_version": version})
+            remove_stale_crx(cache_dir, ext_id, keep=crx_path)
+        except Exception as error:
+            failures += 1
+            log(f"{name}: failed to stage {version}: {error}")
+            continue
+        staged.append((name, version))
+        log(f"{name}: staged {version}; {status}")
+
+    if ext_dir.is_dir():
+        remove_orphans(ext_dir, cache_dir, set(extensions), args.dry_run)
+    return staged, failures, True
+
+
+def chromium_running(user_data_dir):
+    """True while a Chromium instance holds this user data dir (SingletonLock -> host-pid)."""
+    try:
+        target = os.readlink(user_data_dir / "SingletonLock")
+    except OSError:
+        return False
+    try:
+        os.kill(int(target.rsplit("-", 1)[-1]), 0)
+    except (ValueError, ProcessLookupError):
+        return False
+    except PermissionError:
+        return True
+    return True
+
+
+def local_state_profile_fields(user_data_dir):
+    profile = read_json(user_data_dir / "Local State").get("profile", {})
+    return {key: profile.get(key) for key in ("last_used", "last_active_profiles")}
+
+
+def restore_local_state_profile_fields(user_data_dir, saved):
+    path = user_data_dir / "Local State"
+    local_state = read_json(path)
+    profile = local_state.setdefault("profile", {})
+    for key, value in saved.items():
+        if value is None:
+            profile.pop(key, None)
+        else:
+            profile[key] = value
+    write_json_atomic(path, local_state, compact=True)
+
+
+def profile_state(profile_dir, staged):
+    """Return ({ext_id: (installed version, pending)}, ids needing another start)."""
+    settings, uninstalled = read_profile_prefs(profile_dir)
+    state = {}
+    unfinished = []
+    for ext_id, version in staged.items():
+        entry = settings.get(ext_id)
+        if not isinstance(entry, dict) or not entry.get("manifest"):
+            continue
+        installed = entry["manifest"].get("version") or "0"
+        pending = bool(entry.get("idle_install_info"))
+        state[ext_id] = (installed, pending)
+        if ext_id not in uninstalled and (pending or parse_version(installed) < parse_version(version)):
+            unfinished.append(ext_id)
+    return state, unfinished
+
+
+def start_profile_headless(user_data_dir, profile_name):
+    """Start one profile without a window long enough for Chromium to process the entries."""
+    command = [
+        CHROMIUM_BIN,
+        "--headless=new",
+        f"--user-data-dir={user_data_dir}",
+        f"--profile-directory={profile_name}",
+        "--no-first-run",
+        "--disable-gpu",
+        "about:blank",
+    ]
+    process = subprocess.Popen(command, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+    try:
+        process.wait(timeout=APPLY_WAIT_SECONDS)
+    except subprocess.TimeoutExpired:
+        process.terminate()
+        try:
+            process.wait(timeout=APPLY_EXIT_SECONDS)
+        except subprocess.TimeoutExpired:
+            process.kill()
+            process.wait()
+    for _ in range(APPLY_EXIT_SECONDS):
+        if not chromium_running(user_data_dir):
+            break
+        time.sleep(1)
+    # A SIGTERM'd instance can leave its lock behind; Chromium would ignore a stale one,
+    # but a clean directory keeps the running check above honest.
+    lock = user_data_dir / "SingletonLock"
+    if lock.is_symlink() and not chromium_running(user_data_dir):
+        lock.unlink(missing_ok=True)
+
+
+def apply(user_data_dir, ext_dir, names):
+    """Start every profile headless until nothing staged is pending. Chromium must be closed."""
+    staged = staged_entries(ext_dir)
+    if not staged:
+        log("apply: nothing staged")
+        return 0
+    if chromium_running(user_data_dir):
+        log("apply: Chromium is running; close it and run again")
+        return 1
+    if not Path(CHROMIUM_BIN).exists():
+        log(f"apply: chromium binary not found: {CHROMIUM_BIN}")
+        return 1
+
+    saved_fields = local_state_profile_fields(user_data_dir)
+    leftovers = 0
+    try:
+        for profile_dir in profile_dirs(user_data_dir):
+            before, _ = profile_state(profile_dir, staged)
+            passes = 0
+            unfinished = list(staged)
+            while unfinished and passes < APPLY_MAX_PASSES:
+                passes += 1
+                start_profile_headless(user_data_dir, profile_dir.name)
+                _, unfinished = profile_state(profile_dir, staged)
+            after, _ = profile_state(profile_dir, staged)
+            changes = []
+            for ext_id, (version, _) in after.items():
+                old = before.get(ext_id, (None, False))[0]
+                if old != version:
+                    changes.append(f"{names.get(ext_id, ext_id)} {old or 'new'} -> {version}")
+            summary = ", ".join(changes) if changes else "no changes"
+            log(f"apply: {profile_dir.name}: {summary} ({passes} start{'s' if passes != 1 else ''})")
+            if unfinished:
+                leftovers += len(unfinished)
+                log(f"apply: {profile_dir.name}: still pending: {', '.join(names.get(i, i) for i in unfinished)}")
+    finally:
+        restore_local_state_profile_fields(user_data_dir, saved_fields)
+    return 1 if leftovers else 0
+
+
+def main():
+    parser = argparse.ArgumentParser(description=__doc__.split("\n", 1)[0])
+    parser.add_argument("--user-data-dir", type=Path, default=DEFAULT_USER_DATA_DIR)
+    parser.add_argument("--cache-dir", type=Path, default=DEFAULT_CACHE_DIR)
+    parser.add_argument("--only", metavar="ID", action="append", default=[], help="limit staging to these extension ids")
+    parser.add_argument("--dry-run", action="store_true", help="report without downloading or writing")
+    parser.add_argument("--no-notify", action="store_true", help="skip the desktop notification")
+    parser.add_argument(
+        "--apply",
+        action="store_true",
+        help="after staging, start every profile headless (Chromium must be closed) until the updates are installed",
+    )
+    args = parser.parse_args()
+
+    user_data_dir = args.user_data_dir.expanduser()
+    cache_dir = args.cache_dir.expanduser()
+    ext_dir = user_data_dir / "External Extensions"
+    if not user_data_dir.is_dir():
+        log(f"error: user data dir not found: {user_data_dir}")
+        return 1
+
+    staged, failures, store_reachable = stage(args, user_data_dir, ext_dir, cache_dir)
+    if not args.no_notify and not args.dry_run and not args.apply:
+        notify(staged)
+    log(f"done: {len(staged)} staged, {failures} failed")
+
+    if args.apply and not args.dry_run:
+        names = {ext_id: info["name"] for ext_id, info in discover_extensions(user_data_dir).items()}
+        apply_result = apply(user_data_dir, ext_dir, names)
+        return apply_result or (1 if failures else 0)
+    if not store_reachable:
+        return 1
+    return 1 if failures else 0
+
+
+if __name__ == "__main__":
+    sys.exit(main())
