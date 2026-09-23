@@ -78,6 +78,8 @@ async function main() {
         sort: "desc", // Default to newest first
         limit: 100, // Default limit
     };
+    let getId: number | undefined;
+    let field: "prompt" | "response" = "response";
 
     // Parse arguments
     for (let i = 0; i < args.length; i++) {
@@ -90,7 +92,25 @@ async function main() {
         } else if (args[i] === "--search" && i + 1 < args.length) {
             options.search = args[i + 1];
             i++;
+        } else if (args[i] === "--get" && i + 1 < args.length) {
+            getId = parseInt(args[i + 1], 10);
+            i++;
+        } else if (args[i] === "--field" && i + 1 < args.length) {
+            field = args[i + 1] === "prompt" ? "prompt" : "response";
+            i++;
         }
+    }
+
+    // Print one raw field by id, so callers never parse it out of a list line
+    if (getId !== undefined) {
+        try {
+            const row = db.prepare(`SELECT ${field} AS value FROM requests WHERE id = ?`)
+                .get(getId) as { value: string } | undefined;
+            if (row) Deno.stdout.write(encoder.encode(row.value));
+        } finally {
+            db.close();
+        }
+        return;
     }
 
     try {
@@ -101,14 +121,11 @@ async function main() {
             const formattedDate =
                 `${date.toLocaleDateString()} ${date.toLocaleTimeString()}`;
 
-            // Create truncated preview of prompt (first 50 chars)
-            const promptPreview = row.prompt.length > 50
-                ? row.prompt.substring(0, 50).replace(/\n/g, " ") + "..."
-                : row.prompt.replace(/\n/g, " ");
+            const flat = (text: string) => text.replace(/[\t\n]/g, " ");
 
-            // Output format: [ID] Preview | Full prompt | Full response | [DateTime]
+            // Output format: ID<TAB>prompt<TAB>response<TAB>DateTime (one line per row)
             const line =
-                `[${row.id}] ${promptPreview} | ${row.prompt} | ${row.response} | [${formattedDate}]\n`;
+                `${row.id}\t${flat(row.prompt)}\t${flat(row.response)}\t${formattedDate}\n`;
             Deno.stdout.write(encoder.encode(line));
         }
     } finally {
