@@ -8,7 +8,7 @@ readonly SILENT="${YOUTUBE_MUSIC_BROKER_SILENT:-0}"
 readonly APP_ID="cinhimbnkkaeohfgghhklpknlkffjgod"
 readonly APP_CLASS="chrome-${APP_ID}-Default"
 readonly STARTUP_WM_CLASS="crx_${APP_ID}"
-readonly CHROME_BIN="/opt/google/chrome/google-chrome"
+readonly CHROME_BIN="/usr/bin/chromium"
 readonly FALLBACK_URL="https://music.youtube.com/?source=pwa"
 
 log_debug() { [[ "$DEBUG" == "1" ]] && echo "[DEBUG] $*" >&2; }
