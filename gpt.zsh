@@ -59,7 +59,7 @@ gpt_finish_error() {
 gpt_finish_success() {
     local corrected="$1"
     GPT_REQUEST_LAST_SUGGESTION="$corrected"
-    zle gpt_apply_last_suggestion
+    zle gpt_apply_async_suggestion
     zle redisplay
     gpt_reset_async_state
 }
@@ -181,6 +181,15 @@ gpt_apply_last_suggestion() {
     zle redisplay
 }
 
+# BUFFER is only readable inside a widget, not in the zle -F handler
+gpt_apply_async_suggestion() {
+    if [[ "$BUFFER" == "$GPT_REQUEST_ORIGINAL_BUFFER" ]]; then
+        zle gpt_apply_last_suggestion
+    else
+        zle -M "Line changed while correcting; press ^X^G to apply the correction."
+    fi
+}
+
 choose_from_request_history() {
     local selected=$($history_script \
         | fzf --height 50% --reverse --border \
@@ -207,6 +216,7 @@ choose_from_request_history() {
 # define the widgets
 zle -N gpt_request
 zle -N gpt_apply_last_suggestion
+zle -N gpt_apply_async_suggestion
 zle -N choose_from_request_history
 
 # bind the widgets to keys
