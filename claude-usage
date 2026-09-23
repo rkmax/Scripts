@@ -1,0 +1,426 @@
+#!/usr/bin/env python3
+"""Claude Code model usage: aggregate transcripts, snapshot to history, report.
+
+Transcripts are pruned by cleanupPeriodDays (~30d), so `snapshot` must run
+periodically to build history beyond that window.
+
+  claude-usage report [day|week|month] [--days N] [--models] [--json]
+  claude-usage snapshot [--days N]
+  claude-usage sessions [--days N] [--top N]
+"""
+from __future__ import annotations
+
+import argparse
+import collections
+import datetime as dt
+import glob
+import json
+import os
+import re
+import sys
+
+ACCOUNTS = {
+    "personal": "~/.claude",
+    "work": "~/.claude-work",
+    "octane": "~/.claude-octane",
+}
+DATA_DIR = os.path.expanduser("~/.local/share/claude-usage")
+DAILY = os.path.join(DATA_DIR, "daily.jsonl")
+SESSIONS = os.path.join(DATA_DIR, "sessions.jsonl")
+
+# History row key. Rows are upserted on this tuple.
+DAILY_KEY = ("date", "account", "model", "role", "project", "agent")
+
+# The parent transcript is the only place the subagent's type is recorded: the
+# Agent tool_use carries subagent_type, and its tool_result echoes the agentId
+# that names the child's transcript file.
+AGENT_ID_RE = re.compile(r"agentId: ([0-9a-f]{16,})")
+
+
+def agent_types() -> dict[str, str]:
+    """Map agentId -> subagent_type by pairing tool_use with its tool_result."""
+    types: dict[str, str] = {}
+    for root in ACCOUNTS.values():
+        base = os.path.expanduser(root) + "/projects"
+        if not os.path.isdir(base):
+            continue
+        for path in glob.glob(base + "/**/*.jsonl", recursive=True):
+            if "/subagents/" in path:
+                continue
+            pending: dict[str, str] = {}
+            try:
+                fh = open(path, errors="replace")
+            except OSError:
+                continue
+            with fh:
+                for line in fh:
+                    if '"subagent_type"' not in line and "agentId: " not in line:
+                        continue
+                    try:
+                        d = json.loads(line)
+                    except ValueError:
+                        continue
+                    for c in (d.get("message", {}).get("content") or []):
+                        if not isinstance(c, dict):
+                            continue
+                        inp = c.get("input")
+                        if c.get("type") == "tool_use" and isinstance(inp, dict) \
+                                and "subagent_type" in inp:
+                            pending[c["id"]] = inp["subagent_type"]
+                        elif c.get("type") == "tool_result" and c.get("tool_use_id") in pending:
+                            m = AGENT_ID_RE.search(str(c.get("content")))
+                            if m:
+                                types[m.group(1)] = pending[c["tool_use_id"]]
+    return types
+
+
+def project_of(cwd: str) -> str:
+    return os.path.basename(cwd.rstrip("/")) or "-" if cwd else "-"
+
+
+def scan():
+    """Yield one record per unique API response found in transcripts."""
+    seen = set()
+    types = agent_types()
+    for account, root in ACCOUNTS.items():
+        base = os.path.expanduser(root) + "/projects"
+        if not os.path.isdir(base):
+            continue
+        for path in glob.glob(base + "/**/*.jsonl", recursive=True):
+            sidechain_file = "/subagents/" in path
+            try:
+                fh = open(path, errors="replace")
+            except OSError:
+                continue
+            with fh:
+                for line in fh:
+                    if '"assistant"' not in line:
+                        continue
+                    try:
+                        d = json.loads(line)
+                    except ValueError:
+                        continue
+                    if d.get("type") != "assistant":
+                        continue
+                    msg = d.get("message") or {}
+                    mid = msg.get("id")
+                    # Claude Code writes one line per content block, repeating
+                    # the same message.id and the full usage payload. Counting
+                    # lines inflates tokens ~2.4x.
+                    if not mid or mid in seen:
+                        continue
+                    seen.add(mid)
+                    try:
+                        ts = dt.datetime.fromisoformat(
+                            d["timestamp"].replace("Z", "+00:00")
+                        ).astimezone()
+                    except (KeyError, ValueError, AttributeError):
+                        continue
+                    u = msg.get("usage") or {}
+                    is_sub = bool(sidechain_file or d.get("isSidechain"))
+                    aid = d.get("agentId")
+                    yield {
+                        "ts": ts,
+                        "date": ts.strftime("%Y-%m-%d"),
+                        "account": account,
+                        "model": msg.get("model") or "unknown",
+                        "role": "sub" if is_sub else "main",
+                        "agent": (types.get(aid, "?") if is_sub else "-"),
+                        "project": project_of(d.get("cwd") or ""),
+                        "session": d.get("sessionId") or "-",
+                        "input": u.get("input_tokens", 0),
+                        "output": u.get("output_tokens", 0),
+                        "cache_creation": u.get("cache_creation_input_tokens", 0),
+                        "cache_read": u.get("cache_read_input_tokens", 0),
+                    }
+
+
+TOKEN_FIELDS = ("input", "output", "cache_creation", "cache_read")
+
+
+def aggregate_daily(records):
+    agg = {}
+    for r in records:
+        key = tuple(r[k] for k in DAILY_KEY)
+        row = agg.get(key)
+        if row is None:
+            row = agg[key] = dict(zip(DAILY_KEY, key, strict=True), reqs=0, sessions=set(),
+                                  **{f: 0 for f in TOKEN_FIELDS})
+        row["reqs"] += 1
+        row["sessions"].add(r["session"])
+        for f in TOKEN_FIELDS:
+            row[f] += r[f]
+    for row in agg.values():
+        row["sessions"] = len(row["sessions"])
+    return agg
+
+
+IDLE_GAP = dt.timedelta(minutes=15)
+
+
+def active_minutes(stamps) -> float:
+    """Wall-clock time actually spent working.
+
+    A session resumed with --resume spans days, so end-start says nothing
+    about how long it ran. Sum the gaps between consecutive requests and
+    drop the ones long enough to be a break rather than a pause.
+    """
+    stamps = sorted(stamps)
+    total = sum((b - a for a, b in zip(stamps, stamps[1:]) if b - a < IDLE_GAP),
+                dt.timedelta())
+    return round(total.total_seconds() / 60, 1)
+
+
+def aggregate_sessions(records):
+    agg = {}
+    for r in records:
+        key = (r["account"], r["session"])
+        s = agg.get(key)
+        if s is None:
+            s = agg[key] = {
+                "account": r["account"], "session": r["session"],
+                "start": r["ts"], "end": r["ts"], "reqs": 0, "stamps": [],
+                "projects": set(), "models": collections.Counter(),
+                "sub_reqs": 0, **{f: 0 for f in TOKEN_FIELDS},
+            }
+        s["start"] = min(s["start"], r["ts"])
+        s["end"] = max(s["end"], r["ts"])
+        s["stamps"].append(r["ts"])
+        s["reqs"] += 1
+        s["sub_reqs"] += r["role"] == "sub"
+        s["projects"].add(r["project"])
+        s["models"][r["model"]] += 1
+        for f in TOKEN_FIELDS:
+            s[f] += r[f]
+    out = []
+    for s in agg.values():
+        out.append({
+            "date": s["start"].strftime("%Y-%m-%d"),
+            "account": s["account"], "session": s["session"],
+            "start": s["start"].isoformat(), "end": s["end"].isoformat(),
+            "minutes": round((s["end"] - s["start"]).total_seconds() / 60, 1),
+            "active_minutes": active_minutes(s["stamps"]),
+            "reqs": s["reqs"], "sub_reqs": s["sub_reqs"],
+            "projects": sorted(s["projects"]),
+            "models": dict(s["models"].most_common()),
+            **{f: s[f] for f in TOKEN_FIELDS},
+        })
+    return out
+
+
+def load_jsonl(path):
+    if not os.path.exists(path):
+        return []
+    with open(path, errors="replace") as fh:
+        return [json.loads(l) for l in fh if l.strip()]
+
+
+def write_jsonl(path, rows):
+    os.makedirs(os.path.dirname(path), exist_ok=True)
+    tmp = path + ".tmp"
+    with open(tmp, "w") as fh:
+        for r in rows:
+            fh.write(json.dumps(r, ensure_ascii=False) + "\n")
+    os.replace(tmp, path)
+
+
+def cmd_snapshot(args):
+    """Merge live transcripts into history.
+
+    Transcripts are the only source for days still inside the retention
+    window, and history the only source for older ones. A day is replaced
+    whole or not at all: partial rewrites silently drop requests. Once
+    cleanupPeriodDays starts pruning a day the fresh count shrinks, so a
+    day that would lose requests keeps its recorded version instead.
+    """
+    records = list(scan())
+    if not records:
+        print("snapshot: no hay transcripts legibles", file=sys.stderr)
+        return
+
+    fresh = aggregate_daily(records)
+    fresh_by_date = collections.defaultdict(list)
+    for row in fresh.values():
+        fresh_by_date[row["date"]].append(row)
+
+    hist_by_date = collections.defaultdict(list)
+    for row in load_jsonl(DAILY):
+        hist_by_date[row["date"]].append(row)
+
+    rows, shrunk = [], []
+    for date in sorted(set(fresh_by_date) | set(hist_by_date)):
+        new_rows, old_rows = fresh_by_date.get(date), hist_by_date.get(date)
+        if not new_rows:
+            rows.extend(old_rows)
+            continue
+        if old_rows and sum(r["reqs"] for r in new_rows) < sum(r["reqs"] for r in old_rows):
+            shrunk.append(date)
+            rows.extend(old_rows)
+            continue
+        rows.extend(new_rows)
+    write_jsonl(DAILY, rows)
+
+    fresh_s = aggregate_sessions(records)
+    fresh_ids = {(s["account"], s["session"]) for s in fresh_s}
+    kept_s = [s for s in load_jsonl(SESSIONS)
+              if (s.get("account"), s.get("session")) not in fresh_ids]
+    all_s = sorted(kept_s + fresh_s, key=lambda s: (s["start"], s["account"]))
+    write_jsonl(SESSIONS, all_s)
+
+    dates = sorted(fresh_by_date)
+    msg = (f"snapshot: {len(records):,} requests vivos ({dates[0]}\u2192{dates[-1]}) | "
+           f"daily={len(rows):,} filas, {len(set(r['date'] for r in rows))} días | "
+           f"sessions={len(all_s):,}")
+    if shrunk:
+        msg += f" | {len(shrunk)} día(s) ya purgados, conservados del histórico"
+    print(msg)
+
+
+def bucket(date_str, gran):
+    d = dt.date.fromisoformat(date_str)
+    if gran == "day":
+        return date_str
+    if gran == "week":
+        return f"{d.isocalendar()[0]}-W{d.isocalendar()[1]:02d}"
+    return d.strftime("%Y-%m")
+
+
+def cmd_report(args):
+    rows = load_jsonl(DAILY)
+    source = "history"
+    if not rows:
+        rows = list(aggregate_daily(scan()).values())
+        source = "transcripts (sin history; corre snapshot)"
+    if args.days:
+        cut = (dt.date.today() - dt.timedelta(days=args.days)).isoformat()
+        rows = [r for r in rows if r["date"] >= cut]
+    if not rows:
+        print("sin datos")
+        return
+
+    agg = collections.defaultdict(lambda: collections.Counter())
+    for r in rows:
+        key = (bucket(r["date"], args.gran), r["account"]) + ((r["model"],) if args.models else ())
+        a = agg[key]
+        a["reqs"] += r["reqs"]
+        a["sub"] += r["reqs"] if r["role"] == "sub" else 0
+        for f in TOKEN_FIELDS:
+            a[f] += r[f]
+
+    if args.json:
+        print(json.dumps([{"periodo": k[0], "cuenta": k[1],
+                           **({"modelo": k[2]} if args.models else {}), **dict(v)}
+                          for k, v in sorted(agg.items())], indent=2))
+        return
+
+    print(f"[fuente: {source}]")
+    hdr = ["periodo", "cuenta"] + (["modelo"] if args.models else []) + \
+          ["reqs", "sub%", "output", "input", "cache read"]
+    widths = [12, 9] + ([26] if args.models else []) + [8, 6, 12, 13, 14]
+    def line(cells):
+        return "".join(c.ljust(w) if i < len(widths) - 5 else c.rjust(w)
+                       for i, (c, w) in enumerate(zip(cells, widths)))
+    print(line(hdr))
+    print("-" * sum(widths))
+    for k, v in sorted(agg.items()):
+        print(line(list(k) + [
+            f"{v['reqs']:,}", f"{100 * v['sub'] // max(v['reqs'], 1)}%",
+            f"{v['output']:,}", f"{v['input'] + v['cache_creation']:,}",
+            f"{v['cache_read']:,}"]))
+
+
+def fmt_dur(minutes: float) -> str:
+    h, m = divmod(int(minutes), 60)
+    return f"{h}h{m:02d}" if h else f"{m}m"
+
+
+def cmd_sessions(args):
+    rows = load_jsonl(SESSIONS) or aggregate_sessions(scan())
+    if args.days:
+        cut = (dt.date.today() - dt.timedelta(days=args.days)).isoformat()
+        rows = [r for r in rows if r["date"] >= cut]
+    rows.sort(key=lambda s: -(s["input"] + s["cache_creation"] + s["output"]))
+    print(f"{'fecha':<11}{'cuenta':<9}{'activo':>8}{'total':>8}{'reqs':>7}{'sub%':>6}"
+          f"{'output':>10}{'in+cc':>12}  {'modelos':<40}{'proyecto'}")
+    print("-" * 140)
+    for s in rows[:args.top]:
+        models = " ".join(f"{m.replace('claude-', '')}:{n}" for m, n in list(s["models"].items())[:3])
+        print(f"{s['date']:<11}{s['account']:<9}"
+              f"{fmt_dur(s.get('active_minutes', 0)):>8}{fmt_dur(s['minutes']):>8}{s['reqs']:>7,}"
+              f"{100 * s['sub_reqs'] // max(s['reqs'], 1):>5}%"
+              f"{s['output']:>10,}{s['input'] + s['cache_creation']:>12,}  "
+              f"{models:<40}{','.join(s['projects'][:2])}")
+
+
+def cmd_agents(args):
+    rows = load_jsonl(DAILY)
+    if not rows:
+        rows = list(aggregate_daily(scan()).values())
+    if args.days:
+        cut = (dt.date.today() - dt.timedelta(days=args.days)).isoformat()
+        rows = [r for r in rows if r["date"] >= cut]
+    if args.account:
+        rows = [r for r in rows if r["account"] == args.account]
+
+    agg = collections.defaultdict(collections.Counter)
+    for r in rows:
+        if r["role"] != "sub":
+            continue
+        a = agg[(r.get("agent") or "?", r["model"].replace("claude-", ""))]
+        a["reqs"] += r["reqs"]
+        a["out"] += r["output"]
+        a["in"] += r["input"] + r["cache_creation"]
+        a["cr"] += r["cache_read"]
+    if not agg:
+        print("sin subagentes en el rango")
+        return
+
+    print(f"{'agente':<22}{'modelo':<16}{'reqs':>8}{'out/req':>9}{'in/req':>9}"
+          f"{'output':>12}{'cache read':>14}")
+    print("-" * 90)
+    for (agent, model), a in sorted(agg.items(), key=lambda kv: -kv[1]["reqs"]):
+        if a["reqs"] < args.min_reqs:
+            continue
+        print(f"{agent:<22}{model:<16}{a['reqs']:>8,}{a['out'] // a['reqs']:>9,}"
+              f"{a['in'] // a['reqs']:>9,}{a['out']:>12,}{a['cr']:>14,}")
+    unknown = sum(v["reqs"] for k, v in agg.items() if k[0] == "?")
+    total = sum(v["reqs"] for v in agg.values())
+    if unknown:
+        print(f"\n'?' = {unknown:,} de {total:,} requests ({100 * unknown // total}%) sin "
+              f"atribuir: el transcript del padre ya fue purgado o no registró el agentId.")
+
+
+def main():
+    p = argparse.ArgumentParser(description=__doc__,
+                                formatter_class=argparse.RawDescriptionHelpFormatter)
+    sub = p.add_subparsers(dest="cmd")
+
+    r = sub.add_parser("report", help="uso por periodo")
+    r.add_argument("gran", nargs="?", default="day", choices=["day", "week", "month"])
+    r.add_argument("--days", type=int, default=0)
+    r.add_argument("--models", action="store_true")
+    r.add_argument("--json", action="store_true")
+    r.set_defaults(func=cmd_report)
+
+    s = sub.add_parser("snapshot", help="fusionar transcripts en el histórico")
+    s.set_defaults(func=cmd_snapshot)
+
+    ag = sub.add_parser("agents", help="consumo por tipo de subagente")
+    ag.add_argument("--days", type=int, default=0)
+    ag.add_argument("--account", choices=list(ACCOUNTS))
+    ag.add_argument("--min-reqs", type=int, default=20)
+    ag.set_defaults(func=cmd_agents)
+
+    ss = sub.add_parser("sessions", help="sesiones más pesadas")
+    ss.add_argument("--days", type=int, default=0)
+    ss.add_argument("--top", type=int, default=20)
+    ss.set_defaults(func=cmd_sessions)
+
+    args = p.parse_args()
+    if not getattr(args, "func", None):
+        p.print_help()
+        return
+    args.func(args)
+
+
+main()
