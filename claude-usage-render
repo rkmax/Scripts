@@ -1,0 +1,1653 @@
+#!/usr/bin/env python3
+"""Claude Code model usage: self-contained HTML dashboard.
+
+  claude-usage-render [--out PATH] [--data-dir DIR]
+
+Reads the history written by `claude-usage snapshot` (daily.jsonl,
+sessions.jsonl) and renders one offline HTML file: model mix over time,
+main/sub routing per model, and the heaviest sessions. No network, no
+external assets: the data is embedded and every chart is inline SVG.
+"""
+from __future__ import annotations
+
+import argparse
+import collections
+import datetime as dt
+import json
+import os
+import re
+import sys
+
+DATA_DIR = os.path.expanduser("~/.local/share/claude-usage")
+TOKEN_FIELDS = ("input", "output", "cache_creation", "cache_read")
+
+# Categorical slots 1-7 of the validated palette. Slot 8 is reserved for the
+# main/sub role accent so a role colour never impersonates a model colour.
+# Validated with dataviz/scripts/validate_palette.js in both modes:
+#   light  #2a78d6,#eb6834,#1baf7a,#eda100,#e87ba4,#008300,#4a3aa7  -> all pass
+#   dark   #3987e5,#d95926,#199e70,#c98500,#d55181,#008300,#9085e9  -> all pass
+MODEL_SLOTS = 7
+# A model below this share of all recorded requests folds into "otros".
+FOLD_SHARE = 0.005
+
+
+def load_jsonl(path):
+    if not os.path.exists(path):
+        return []
+    rows = []
+    with open(path, errors="replace") as fh:
+        for line in fh:
+            line = line.strip()
+            if not line:
+                continue
+            try:
+                rows.append(json.loads(line))
+            except ValueError:
+                continue
+    return rows
+
+
+def model_label(model: str) -> str:
+    """claude-haiku-4-5-20251001 -> haiku 4.5 ; <synthetic> -> synthetic."""
+    if not model:
+        return "?"
+    if model.startswith("<") and model.endswith(">"):
+        return model[1:-1]
+    name = re.sub(r"-20\d{6}$", "", model.replace("claude-", ""))
+    head, _, tail = name.partition("-")
+    return f"{head} {tail.replace('-', '.')}".strip() if tail else head
+
+
+def model_family(model: str) -> str:
+    if model.startswith("<"):
+        return "otro"
+    return re.sub(r"-20\d{6}$", "", model.replace("claude-", "")).split("-")[0]
+
+
+def build_models(daily):
+    """Freeze one colour slot per model, ranked over the whole history.
+
+    The ranking is computed once from every row so a filter can never
+    repaint a model: slots are stable across granularity, account and range.
+    """
+    reqs = collections.Counter()
+    for r in daily:
+        reqs[r.get("model", "?")] += r.get("reqs", 0)
+    total = sum(reqs.values()) or 1
+    ranked = [m for m, n in reqs.most_common() if n / total >= FOLD_SHARE]
+    kept = ranked[:MODEL_SLOTS]
+    folded = [m for m in reqs if m not in kept]
+
+    classes = [{"ids": [m], "label": model_label(m), "family": model_family(m),
+                "slot": i + 1} for i, m in enumerate(kept)]
+    if folded:
+        classes.append({"ids": sorted(folded), "label": "otros",
+                        "family": "otro", "slot": 0})
+    index = {}
+    for i, c in enumerate(classes):
+        for m in c["ids"]:
+            index[m] = i
+    return classes, index
+
+
+def build_agents(daily):
+    """Sub-agent types, ranked by requests. `-` is the main agent (no type).
+
+    `?` means the parent transcript was already pruned, so the request could
+    not be attributed. It stays a category of its own.
+    """
+    reqs = collections.Counter()
+    for r in daily:
+        if r.get("role") == "sub":
+            reqs[r.get("agent") or "?"] += r.get("reqs", 0)
+    order = [a for a, _ in reqs.most_common()]
+    labels = ["sin atribuir" if a == "?" else a for a in order]
+    return labels, {a: i for i, a in enumerate(order)}
+
+
+def build_payload(daily, sessions):
+    classes, midx = build_models(daily)
+    agent_labels, agidx = build_agents(daily)
+    accounts = sorted({r.get("account", "?") for r in daily}
+                      | {s.get("account", "?") for s in sessions})
+    aidx = {a: i for i, a in enumerate(accounts)}
+    fallback = len(classes) - 1 if classes else 0
+
+    # Family travels next to the colour class on purpose: the fold merges rare
+    # models of different families into "otros", so a class can no longer
+    # answer "is this an Opus request".
+    families, fmidx = [], {}
+
+    def family_id(model):
+        fam = model_family(model)
+        if fam not in fmidx:
+            fmidx[fam] = len(families)
+            families.append(fam)
+        return fmidx[fam]
+
+    # Collapse project away: no chart slices by project, and dropping it keeps
+    # the embedded daily table small even with the agent dimension added.
+    agg = collections.defaultdict(lambda: [0, 0, 0, 0, 0])
+    for r in daily:
+        sub = r.get("role") == "sub"
+        key = (r.get("date", ""), aidx.get(r.get("account"), 0),
+               midx.get(r.get("model"), fallback),
+               family_id(r.get("model") or "?"),
+               1 if sub else 0,
+               agidx.get(r.get("agent") or "?", -1) if sub else -1)
+        cell = agg[key]
+        cell[0] += r.get("reqs", 0)
+        for i, f in enumerate(TOKEN_FIELDS):
+            cell[i + 1] += r.get(f, 0)
+    daily_rows = [list(k) + v for k, v in sorted(agg.items())]
+
+    projects = []
+    pidx = {}
+
+    def project_id(name):
+        if name not in pidx:
+            pidx[name] = len(projects)
+            projects.append(name)
+        return pidx[name]
+
+    session_rows = []
+    for s in sessions:
+        mix = collections.Counter()
+        for model, n in (s.get("models") or {}).items():
+            mix[midx.get(model, fallback)] += n
+        session_rows.append([
+            s.get("date", ""),
+            aidx.get(s.get("account"), 0),
+            (s.get("session") or "")[:8],
+            round(float(s.get("active_minutes") or 0), 1),
+            round(float(s.get("minutes") or 0), 1),
+            s.get("reqs", 0),
+            s.get("sub_reqs", 0),
+            [project_id(p) for p in (s.get("projects") or [])],
+            sorted(mix.items()),
+            s.get("input", 0), s.get("output", 0),
+            s.get("cache_creation", 0), s.get("cache_read", 0),
+        ])
+    session_rows.sort(key=lambda r: r[0])
+
+    dates = [r[0] for r in daily_rows] + [r[0] for r in session_rows]
+    return {
+        "generated": dt.datetime.now().astimezone().strftime("%Y-%m-%d %H:%M"),
+        "min": min(dates) if dates else "",
+        "max": max(dates) if dates else "",
+        "models": [{"label": c["label"], "family": c["family"], "slot": c["slot"]}
+                   for c in classes],
+        "agents": agent_labels,
+        "families": families,
+        "accounts": accounts,
+        "projects": projects,
+        "daily": daily_rows,
+        "sessions": session_rows,
+    }
+
+
+TEMPLATE = r"""<!doctype html>
+<html lang="es">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Uso de modelos - Claude Code</title>
+<style>
+:root {
+  color-scheme: light dark;
+  --plane: #f9f9f7;
+  --surface: #fcfcfb;
+  --ink: #0b0b0b;
+  --ink-2: #52514e;
+  --muted: #898781;
+  --grid: #e1e0d9;
+  --axis: #c3c2b7;
+  --border: rgba(11,11,11,0.10);
+  --s1: #2a78d6; --s2: #eb6834; --s3: #1baf7a; --s4: #eda100;
+  --s5: #e87ba4; --s6: #008300; --s7: #4a3aa7; --s0: #898781;
+  --role-main: #52514e;
+  --role-sub: #e34948;
+  --role-sub-track: #f7d7d7;
+  --spark: #c3c2b7;
+}
+@media (prefers-color-scheme: dark) {
+  :root:where(:not([data-theme="light"])) {
+    --plane: #0d0d0d;
+    --surface: #1a1a19;
+    --ink: #ffffff;
+    --ink-2: #c3c2b7;
+    --muted: #898781;
+    --grid: #2c2c2a;
+    --axis: #383835;
+    --border: rgba(255,255,255,0.10);
+    --s1: #3987e5; --s2: #d95926; --s3: #199e70; --s4: #c98500;
+    --s5: #d55181; --s6: #008300; --s7: #9085e9; --s0: #898781;
+    --role-main: #c3c2b7;
+    --role-sub: #e66767;
+    --role-sub-track: #4a2b2b;
+    --spark: #52514e;
+  }
+}
+* { box-sizing: border-box; }
+html { background: var(--plane); }
+body {
+  margin: 0;
+  padding: 24px 20px 56px;
+  background: var(--plane);
+  color: var(--ink);
+  font: 14px/1.5 system-ui, -apple-system, "Segoe UI", sans-serif;
+  -webkit-font-smoothing: antialiased;
+}
+.wrap { max-width: 1240px; margin: 0 auto; }
+h1 { font-size: 20px; font-weight: 600; margin: 0 0 4px; letter-spacing: -0.01em; }
+h2 { font-size: 15px; font-weight: 600; margin: 0 0 2px; }
+.sub { color: var(--ink-2); font-size: 13px; margin: 0; }
+.hint { color: var(--muted); font-size: 12px; margin: 2px 0 0; }
+
+.filters {
+  display: flex; flex-wrap: wrap; gap: 8px 18px; align-items: flex-end;
+  margin: 20px 0 18px; padding: 12px 14px;
+  background: var(--surface); border: 1px solid var(--border); border-radius: 10px;
+}
+.filter { display: flex; flex-direction: column; gap: 5px; min-width: 0; max-width: 100%; }
+.filter > span { font-size: 11px; color: var(--muted); text-transform: uppercase; letter-spacing: 0.06em; }
+/* Wraps rather than forcing the page to scroll sideways on a narrow screen. */
+.seg { display: flex; flex-wrap: wrap; max-width: 100%; border: 1px solid var(--border); border-radius: 7px; overflow: hidden; }
+.seg button {
+  font: inherit; font-size: 12.5px; padding: 5px 11px; border: 0; cursor: pointer;
+  background: transparent; color: var(--ink-2); border-right: 1px solid var(--border);
+}
+.seg button:last-child { border-right: 0; }
+.seg button:hover { background: var(--grid); }
+.seg button[aria-pressed="true"] { background: var(--ink); color: var(--surface); font-weight: 600; }
+.seg button:focus-visible { outline: 2px solid var(--s1); outline-offset: -2px; }
+
+section { margin: 26px 0 0; }
+.section-head { margin-bottom: 10px; }
+.card {
+  background: var(--surface); border: 1px solid var(--border); border-radius: 10px;
+  padding: 14px 16px 12px; min-width: 0;
+}
+.stack { display: grid; gap: 14px; }
+/* min() lets the track collapse below its preferred width instead of forcing
+   the page to scroll sideways on a phone. */
+.grid-2 { display: grid; gap: 14px; grid-template-columns: repeat(auto-fit, minmax(min(340px, 100%), 1fr)); }
+.kpis { display: grid; gap: 12px; grid-template-columns: repeat(auto-fit, minmax(min(190px, 100%), 1fr)); }
+.kpi { background: var(--surface); border: 1px solid var(--border); border-radius: 10px; padding: 13px 14px 12px; min-width: 0; }
+.kpi .label { font-size: 12px; color: var(--ink-2); }
+.kpi .value { font-size: 26px; font-weight: 600; letter-spacing: -0.02em; margin-top: 3px; }
+.kpi .note { font-size: 11.5px; color: var(--muted); margin-top: 2px; }
+/* Full width, so the remaining tiles always fill their row instead of
+   stranding one of them below a hero that spans an awkward two columns. */
+.kpi.hero {
+  grid-column: 1 / -1;
+  display: grid; grid-template-columns: minmax(230px, auto) 1fr;
+  gap: 0 30px; align-items: center;
+}
+.kpi.hero .label { grid-column: 1; grid-row: 1; }
+.kpi.hero .value { grid-column: 1; grid-row: 2; font-size: 52px; line-height: 1.05; margin-top: 4px; }
+.kpi.hero .note { grid-column: 1; grid-row: 3; }
+.kpi.hero .strip { grid-column: 2; grid-row: 1 / -1; margin-top: 0; }
+.kpi.hero .strip svg { height: 14px; }
+@media (max-width: 620px) {
+  .kpi.hero { grid-template-columns: 1fr; }
+  .kpi.hero .value { font-size: 40px; }
+  .kpi.hero .strip { grid-column: 1; grid-row: auto; margin-top: 10px; }
+}
+.strip { margin-top: 9px; }
+
+/* A chart narrower than its labels can bear scrolls inside its own card;
+   the page body never scrolls sideways. */
+.chart { width: 100%; min-width: 0; overflow-x: auto; }
+.chart:focus-visible { outline: 2px solid var(--s1); outline-offset: 2px; border-radius: 4px; }
+svg { display: block; overflow: visible; }
+.legend { display: flex; flex-wrap: wrap; gap: 4px 14px; margin: 8px 0 2px; font-size: 12px; color: var(--ink-2); }
+.legend span { display: inline-flex; align-items: center; gap: 6px; }
+.legend i { width: 11px; height: 11px; border-radius: 2px; display: inline-block; }
+.legend i.line { width: 14px; height: 3px; border-radius: 2px; }
+
+details { margin-top: 10px; }
+summary { cursor: pointer; font-size: 12px; color: var(--ink-2); width: fit-content; }
+summary:focus-visible { outline: 2px solid var(--s1); outline-offset: 2px; }
+.table-wrap { overflow-x: auto; margin-top: 8px; }
+table { border-collapse: collapse; font-size: 12.5px; width: 100%; }
+th, td { padding: 5px 10px 5px 0; text-align: left; white-space: nowrap; }
+th { color: var(--muted); font-weight: 500; border-bottom: 1px solid var(--grid); font-size: 11.5px; }
+td { border-bottom: 1px solid var(--grid); color: var(--ink-2); }
+td.n, th.n { text-align: right; font-variant-numeric: tabular-nums; }
+td.k { color: var(--ink); }
+.mix-cell { min-width: 150px; }
+.meter { display: inline-flex; align-items: center; gap: 7px; }
+.meter .track { width: 52px; height: 6px; border-radius: 3px; background: var(--role-sub-track); overflow: hidden; }
+.meter .fill { height: 100%; background: var(--role-sub); border-radius: 3px; }
+.dot { display: inline-block; width: 8px; height: 8px; border-radius: 2px; margin-right: 5px; vertical-align: -1px; }
+
+.tooltip {
+  position: fixed; z-index: 20; pointer-events: none; max-width: 300px;
+  background: var(--surface); color: var(--ink);
+  border: 1px solid var(--border); border-radius: 8px;
+  padding: 8px 10px; font-size: 12px;
+  box-shadow: 0 6px 20px rgba(0,0,0,0.16);
+}
+.tooltip .t-head { color: var(--ink-2); font-size: 11.5px; margin-bottom: 5px; }
+.tooltip .t-row { display: flex; align-items: baseline; gap: 7px; }
+.tooltip .t-key { width: 13px; height: 3px; border-radius: 2px; flex: none; transform: translateY(-3px); }
+.tooltip .t-val { font-weight: 600; font-variant-numeric: tabular-nums; }
+.tooltip .t-name { color: var(--ink-2); }
+.tooltip .t-foot { color: var(--muted); font-size: 11px; margin-top: 5px; border-top: 1px solid var(--grid); padding-top: 4px; }
+footer { margin-top: 34px; color: var(--muted); font-size: 12px; }
+footer p { margin: 3px 0; }
+.empty { color: var(--ink-2); padding: 18px 0; }
+</style>
+</head>
+<body>
+<div class="wrap">
+  <header>
+    <h1>Uso de modelos &middot; Claude Code</h1>
+    <p class="sub" id="head-sub"></p>
+  </header>
+
+  <div class="filters" id="filters" role="group" aria-label="Filtros">
+    <label class="filter"><span>Granularidad</span>
+      <span class="seg" data-key="gran">
+        <button type="button" data-v="day">Día</button>
+        <button type="button" data-v="week">Semana</button>
+        <button type="button" data-v="month">Mes</button>
+      </span>
+    </label>
+    <label class="filter"><span>Cuenta</span>
+      <span class="seg" data-key="account" id="seg-account"></span>
+    </label>
+    <label class="filter"><span>Rango</span>
+      <span class="seg" data-key="range">
+        <button type="button" data-v="30">30 d</button>
+        <button type="button" data-v="90">90 d</button>
+        <button type="button" data-v="180">180 d</button>
+        <button type="button" data-v="365">1 año</button>
+        <button type="button" data-v="0">Todo</button>
+      </span>
+    </label>
+    <label class="filter"><span>Métrica (series temporales)</span>
+      <span class="seg" data-key="metric">
+        <button type="button" data-v="reqs">Requests</button>
+        <button type="button" data-v="output">Output</button>
+        <button type="button" data-v="read">Contexto leído</button>
+      </span>
+    </label>
+  </div>
+
+  <main id="main">
+    <section aria-label="Resumen">
+      <div class="kpis" id="kpis"></div>
+    </section>
+
+    <section aria-label="Evolución">
+      <div class="section-head">
+        <h2>Qué modelos se usan y cómo evoluciona</h2>
+        <p class="hint">Las series nunca se suman entre modelos: cada periodo se ve desglosado por modelo.</p>
+      </div>
+      <div class="stack">
+        <div class="card">
+          <h2 id="t-volume-title">Volumen por modelo</h2>
+          <p class="hint" id="t-volume-hint"></p>
+          <div class="legend" id="lg-volume"></div>
+          <div class="chart" id="ch-volume" tabindex="0" role="img"></div>
+          <details><summary>Ver tabla</summary><div class="table-wrap" id="tb-volume"></div></details>
+        </div>
+        <div class="card">
+          <h2>Mix de modelos (% del periodo)</h2>
+          <p class="hint">Misma métrica, normalizada: revela el reparto aunque cambie el volumen.</p>
+          <div class="legend" id="lg-mix"></div>
+          <div class="chart" id="ch-mix" tabindex="0" role="img"></div>
+          <details><summary>Ver tabla</summary><div class="table-wrap" id="tb-mix"></div></details>
+        </div>
+      </div>
+    </section>
+
+    <section aria-label="Enrutamiento">
+      <div class="section-head">
+        <h2>Enrutamiento: agente principal vs subagente</h2>
+        <p class="hint">Un subagente que lee muchísimo contexto y devuelve muy poco output es la firma del mal enrutamiento.</p>
+      </div>
+      <div class="stack">
+        <div class="card">
+          <h2>Requests por modelo</h2>
+          <p class="hint">Etiqueta a la derecha: qué porcentaje de ese modelo lo consumen subagentes.</p>
+          <div class="legend" id="lg-role"></div>
+          <div class="chart" id="ch-role" role="img"></div>
+        </div>
+        <div class="grid-2">
+          <div class="card">
+            <h2>Output por request</h2>
+            <p class="hint">Cuánto produce cada llamada. Barra de subagente muy corta = trabajo caro sin producto.</p>
+            <div class="legend" id="lg-out"></div>
+            <div class="chart" id="ch-out" role="img"></div>
+          </div>
+          <div class="card">
+            <h2>Contexto leído por request</h2>
+            <p class="hint">Input + cache creation + cache read por llamada.</p>
+            <div class="legend" id="lg-read"></div>
+            <div class="chart" id="ch-read" role="img"></div>
+          </div>
+        </div>
+        <div class="card">
+          <h2>Detalle por modelo y rol</h2>
+          <div class="table-wrap" id="tb-routing"></div>
+        </div>
+      </div>
+    </section>
+
+    <section aria-label="Agentes">
+      <div class="section-head">
+        <h2>Consumo por subagente</h2>
+        <p class="hint">Sólo requests de subagente. <em>sin atribuir</em> = el transcript del padre ya fue purgado y no se pudo saber el tipo.</p>
+      </div>
+      <div class="stack">
+        <div class="card">
+          <h2>Cache read por subagente</h2>
+          <p class="hint">Los tokens releídos son lo que de verdad quema el límite del plan. Segmentado por el modelo en el que corrió.</p>
+          <div class="legend" id="lg-agent"></div>
+          <div class="chart" id="ch-agent" role="img"></div>
+        </div>
+        <div class="grid-2">
+          <div class="card">
+            <h2>Mismo agente, distinto modelo: output por request</h2>
+            <p class="hint">Si el modelo grande no produce más, no está comprando nada. Sólo pares agente&times;modelo con &ge; 20 requests.</p>
+            <div class="legend" id="lg-agent-out"></div>
+            <div class="chart" id="ch-agent-out" role="img"></div>
+          </div>
+          <div class="card">
+            <h2>Mismo agente, distinto modelo: cache read por request</h2>
+            <p class="hint">Cuánto contexto arrastra cada llamada de ese agente en ese modelo.</p>
+            <div class="legend" id="lg-agent-read"></div>
+            <div class="chart" id="ch-agent-read" role="img"></div>
+          </div>
+        </div>
+        <div class="card">
+          <h2>Detalle por subagente y modelo</h2>
+          <div class="table-wrap" id="tb-agent"></div>
+        </div>
+      </div>
+    </section>
+
+    <section aria-label="Sesiones">
+      <div class="section-head">
+        <h2>Sesiones más pesadas</h2>
+        <p class="hint">Duración activa = suma de huecos entre requests menores de 15 min (el tiempo real de trabajo, no el calendario).</p>
+      </div>
+      <div class="card">
+        <div class="filters" style="margin:0 0 12px">
+          <label class="filter"><span>Ordenar por</span>
+            <span class="seg" data-key="sort">
+              <button type="button" data-v="read">Contexto leído</button>
+              <button type="button" data-v="reqs">Requests</button>
+              <button type="button" data-v="output">Output</button>
+              <button type="button" data-v="active">Duración activa</button>
+              <button type="button" data-v="rate">Intensidad</button>
+            </span>
+          </label>
+          <label class="filter"><span>Mostrar</span>
+            <span class="seg" data-key="top">
+              <button type="button" data-v="20">20</button>
+              <button type="button" data-v="50">50</button>
+              <button type="button" data-v="200">200</button>
+            </span>
+          </label>
+        </div>
+        <div class="legend" id="lg-sessions"></div>
+        <div class="table-wrap" id="tb-sessions"></div>
+      </div>
+    </section>
+  </main>
+
+  <footer>
+    <p><strong>Contexto leído</strong> = input + cache creation + cache read. <strong>Intensidad</strong> = contexto leído por hora activa (sólo sesiones con &ge; 5 min activos).</p>
+    <p><strong>sub</strong> = requests de subagente (sidechain). Las sesiones únicas salen de sessions.jsonl; el campo <code>sessions</code> de daily.jsonl no es sumable.</p>
+    <p>k = mil &middot; M = millón &middot; G = mil millones. Generado por <code>claude-usage-render</code>; sin recursos externos.</p>
+  </footer>
+</div>
+
+<div class="tooltip" id="tip" hidden></div>
+<script type="application/json" id="payload">__PAYLOAD__</script>
+<script>
+(function () {
+'use strict';
+
+var D = JSON.parse(document.getElementById('payload').textContent);
+var TIP = document.getElementById('tip');
+var MES = ['ene','feb','mar','abr','may','jun','jul','ago','sep','oct','nov','dic'];
+var SLOT_VAR = ['var(--s0)','var(--s1)','var(--s2)','var(--s3)','var(--s4)','var(--s5)','var(--s6)','var(--s7)'];
+var ROLE = [
+  {key: 'main', label: 'Principal', color: 'var(--role-main)'},
+  {key: 'sub', label: 'Subagente', color: 'var(--role-sub)'}
+];
+var METRICS = {
+  reqs:   {label: 'Requests', unit: 'requests', fmt: fmtNum},
+  output: {label: 'Output', unit: 'tokens de output', fmt: fmtTok},
+  read:   {label: 'Contexto leído', unit: 'tokens leídos', fmt: fmtTok}
+};
+// daily row: [date, accountIdx, modelIdx, familyIdx, roleIdx, agentIdx,
+//             reqs, input, output, cache_creation, cache_read]
+var R_DATE = 0, R_ACC = 1, R_MOD = 2, R_FAM = 3, R_ROLE = 4, R_AGENT = 5,
+    R_REQS = 6, R_IN = 7, R_OUT = 8, R_CC = 9, R_CR = 10;
+// A pair below this many requests has an unstable per-request average.
+var MIN_PAIR_REQS = 20;
+// session row: [date, acc, id, active, total, reqs, sub, projects, mix, in, out, cc, cr]
+var S_DATE = 0, S_ACC = 1, S_ID = 2, S_ACT = 3, S_TOT = 4, S_REQS = 5, S_SUB = 6,
+    S_PROJ = 7, S_MIX = 8, S_IN = 9, S_OUT = 10, S_CC = 11, S_CR = 12;
+
+var state = {gran: 'week', account: 'all', range: '90', metric: 'reqs', sort: 'read', top: '20'};
+
+/* ---------- formatting ---------- */
+function fmtNum(n) { return Math.round(n).toLocaleString('es-CO'); }
+function dec(n, d) { return n.toFixed(d).replace('.', ','); }
+function fmtTok(n) {
+  n = Number(n) || 0;
+  if (n >= 1e9) return dec(n / 1e9, n >= 1e10 ? 0 : 1) + ' G';
+  if (n >= 1e6) return dec(n / 1e6, n >= 1e7 ? 0 : 1) + ' M';
+  if (n >= 1e3) return dec(n / 1e3, n >= 1e4 ? 0 : 1) + ' k';
+  return String(Math.round(n));
+}
+function fmtCompact(n) { return n >= 1000 ? fmtTok(n) : String(Math.round(n)); }
+function fmtPct(x) { return dec(100 * x, x >= 0.1 ? 0 : 1) + '%'; }
+function fmtDur(minutes) {
+  var m = Math.round(Number(minutes) || 0);
+  if (!m) return '-';
+  var h = Math.floor(m / 60);
+  return h ? h + 'h' + String(m % 60).padStart(2, '0') : m + 'm';
+}
+function readOf(row) { return row[R_IN] + row[R_CC] + row[R_CR]; }
+
+/* ---------- dates ---------- */
+function toDate(s) { return new Date(s + 'T00:00:00'); }
+function isoOf(d) {
+  return d.getFullYear() + '-' + String(d.getMonth() + 1).padStart(2, '0') +
+         '-' + String(d.getDate()).padStart(2, '0');
+}
+function weekStart(s) {
+  var d = toDate(s);
+  d.setDate(d.getDate() - ((d.getDay() + 6) % 7));
+  return isoOf(d);
+}
+function periodOf(s, gran) {
+  if (gran === 'month') return s.slice(0, 7);
+  if (gran === 'week') return weekStart(s);
+  return s;
+}
+function periodLabel(key, gran) {
+  var p = key.split('-');
+  if (gran === 'month') return MES[+p[1] - 1] + ' ' + p[0].slice(2);
+  return (+p[2]) + ' ' + MES[+p[1] - 1];
+}
+function periodTitle(key, gran) {
+  var p = key.split('-');
+  if (gran === 'month') return MES[+p[1] - 1] + ' ' + p[0];
+  var full = (+p[2]) + ' ' + MES[+p[1] - 1] + ' ' + p[0];
+  return gran === 'week' ? 'Semana del ' + full : full;
+}
+function cutoffDate() {
+  var days = +state.range;
+  if (!days || !D.max) return D.min || '';
+  var d = toDate(D.max);
+  d.setDate(d.getDate() - (days - 1));
+  var iso = isoOf(d);
+  return iso > D.min ? iso : D.min;
+}
+function periodSequence(from, to, gran) {
+  var out = [], seen = Object.create(null);
+  if (!from || !to) return out;
+  var d = toDate(from), end = toDate(to);
+  while (d <= end) {
+    var k = periodOf(isoOf(d), gran);
+    if (!seen[k]) { seen[k] = 1; out.push(k); }
+    d.setDate(d.getDate() + 1);
+  }
+  return out;
+}
+
+/* ---------- slicing ---------- */
+function slice() {
+  var from = cutoffDate();
+  var acc = state.account;
+  var accIdx = acc === 'all' ? -1 : D.accounts.indexOf(acc);
+  var daily = [], sessions = [];
+  var i, r;
+  for (i = 0; i < D.daily.length; i++) {
+    r = D.daily[i];
+    if (r[R_DATE] < from) continue;
+    if (accIdx >= 0 && r[R_ACC] !== accIdx) continue;
+    daily.push(r);
+  }
+  for (i = 0; i < D.sessions.length; i++) {
+    r = D.sessions[i];
+    if (r[S_DATE] < from) continue;
+    if (accIdx >= 0 && r[S_ACC] !== accIdx) continue;
+    sessions.push(r);
+  }
+  return {from: from, to: D.max, daily: daily, sessions: sessions};
+}
+function metricOf(row, metric) {
+  if (metric === 'reqs') return row[R_REQS];
+  if (metric === 'output') return row[R_OUT];
+  return readOf(row);
+}
+
+/* ---------- DOM helpers ---------- */
+function clear(node) { while (node.firstChild) node.removeChild(node.firstChild); }
+function h(tag, cls, text) {
+  var e = document.createElement(tag);
+  if (cls) e.className = cls;
+  if (text != null) e.textContent = text;
+  return e;
+}
+function mkSvg(host, width, height) {
+  clear(host);
+  // Drop the previous render's key handler: its marks point at removed nodes.
+  host.onkeydown = null;
+  host.onblur = null;
+  host.innerHTML = '<svg></svg>';
+  var s = host.firstChild;
+  s.setAttribute('width', width);
+  s.setAttribute('height', height);
+  s.setAttribute('viewBox', '0 0 ' + width + ' ' + height);
+  s.NS = s.namespaceURI;
+  return s;
+}
+function node(svg, tag, attrs, style) {
+  var e = document.createElementNS(svg.NS, tag);
+  for (var k in attrs) e.setAttribute(k, attrs[k]);
+  if (style) for (var p in style) e.style[p] = style[p];
+  svg.appendChild(e);
+  return e;
+}
+function txt(svg, x, y, s, opts) {
+  opts = opts || {};
+  var e = node(svg, 'text', {
+    x: x, y: y,
+    'text-anchor': opts.anchor || 'start',
+    'dominant-baseline': opts.baseline || 'auto'
+  });
+  e.style.fill = opts.color || 'var(--muted)';
+  e.style.fontSize = (opts.size || 11) + 'px';
+  if (opts.weight) e.style.fontWeight = opts.weight;
+  if (opts.tabular !== false) e.style.fontVariantNumeric = 'tabular-nums';
+  e.textContent = s;
+  return e;
+}
+// 4px rounded data-end, square at the baseline.
+function capPath(x, y, w, hgt, r, side) {
+  r = Math.max(0, Math.min(r, w / 2, hgt / 2));
+  if (r < 0.5) return 'M' + x + ' ' + y + 'h' + w + 'v' + hgt + 'h' + (-w) + 'Z';
+  if (side === 'top') {
+    return 'M' + x + ' ' + (y + hgt) + 'V' + (y + r) + 'a' + r + ' ' + r + ' 0 0 1 ' + r + ' ' + (-r) +
+           'h' + (w - 2 * r) + 'a' + r + ' ' + r + ' 0 0 1 ' + r + ' ' + r + 'V' + (y + hgt) + 'Z';
+  }
+  return 'M' + x + ' ' + y + 'h' + (w - r) + 'a' + r + ' ' + r + ' 0 0 1 ' + r + ' ' + r +
+         'v' + (hgt - 2 * r) + 'a' + r + ' ' + r + ' 0 0 1 ' + (-r) + ' ' + r + 'H' + x + 'Z';
+}
+function niceTicks(max, count) {
+  if (!(max > 0)) return [0, 1];
+  var raw = max / count;
+  var mag = Math.pow(10, Math.floor(Math.log10(raw)));
+  var n = raw / mag;
+  var step = (n <= 1 ? 1 : n <= 2 ? 2 : n <= 2.5 ? 2.5 : n <= 5 ? 5 : 10) * mag;
+  var ticks = [], v = 0;
+  while (v < max - step * 1e-9) { ticks.push(v); v += step; }
+  ticks.push(v);
+  if (v < max) ticks.push(v + step);
+  return ticks;
+}
+
+/* ---------- tooltip ---------- */
+// A keyboard-opened tooltip survives the scroll that bringing the mark into
+// view causes; a pointer-opened one still closes on any scroll.
+var tipSticky = false;
+function showTip(evt, head, rows, foot) {
+  tipSticky = !(evt && evt.type);
+  clear(TIP);
+  TIP.appendChild(h('div', 't-head', head));
+  rows.forEach(function (r) {
+    var line = h('div', 't-row');
+    if (r.color) {
+      var key = h('span', 't-key');
+      key.style.background = r.color;
+      line.appendChild(key);
+    }
+    line.appendChild(h('span', 't-val', r.value));
+    line.appendChild(h('span', 't-name', r.name));
+    TIP.appendChild(line);
+  });
+  if (foot) TIP.appendChild(h('div', 't-foot', foot));
+  TIP.hidden = false;
+  var pad = 14;
+  var box = TIP.getBoundingClientRect();
+  var x = evt.clientX + pad, y = evt.clientY + pad;
+  if (x + box.width > window.innerWidth - 8) x = evt.clientX - box.width - pad;
+  if (y + box.height > window.innerHeight - 8) y = evt.clientY - box.height - pad;
+  TIP.style.left = Math.max(8, x) + 'px';
+  TIP.style.top = Math.max(8, y) + 'px';
+}
+function hideTip() { TIP.hidden = true; tipSticky = false; }
+function anchorOf(el) {
+  var b = el.getBoundingClientRect();
+  return {clientX: b.left + b.width / 2, clientY: b.top + b.height / 2};
+}
+// Chrome makes an SVG element with tabindex focusable but never dispatches a
+// focus event to it, so per-mark focus handlers are dead there. The chart
+// container owns the keyboard instead: arrows step through its marks.
+function keyboardMarks(host, marks) {
+  host.tabIndex = 0;
+  var at = -1;
+  host.onkeydown = function (e) {
+    var step = (e.key === 'ArrowDown' || e.key === 'ArrowRight') ? 1
+             : (e.key === 'ArrowUp' || e.key === 'ArrowLeft') ? -1 : 0;
+    if (!step || !marks.length) return;
+    e.preventDefault();
+    at = at < 0 ? (step > 0 ? 0 : marks.length - 1)
+                : Math.max(0, Math.min(marks.length - 1, at + step));
+    marks[at]();
+  };
+  host.onblur = hideTip;
+}
+document.addEventListener('scroll', function () { if (!tipSticky) hideTip(); }, true);
+
+/* ---------- legends ---------- */
+function legend(host, items, shape) {
+  clear(host);
+  items.forEach(function (it) {
+    var s = document.createElement('span');
+    var sw = document.createElement('i');
+    if (shape === 'line') sw.className = 'line';
+    sw.style.background = it.color;
+    s.appendChild(sw);
+    s.appendChild(document.createTextNode(it.label));
+    host.appendChild(s);
+  });
+}
+function modelItems(used) {
+  return D.models.map(function (m, i) { return {i: i, label: m.label, color: SLOT_VAR[m.slot]}; })
+                 .filter(function (m) { return !used || used[m.i]; });
+}
+
+/* ---------- stacked time chart ---------- */
+function buildTimeSeries(sl) {
+  var gran = state.gran, metric = state.metric;
+  var periods = periodSequence(sl.from, sl.to, gran);
+  var pos = Object.create(null);
+  periods.forEach(function (p, i) { pos[p] = i; });
+  var series = D.models.map(function (m, i) {
+    return {i: i, label: m.label, color: SLOT_VAR[m.slot],
+            values: new Array(periods.length).fill(0)};
+  });
+  var used = {};
+  sl.daily.forEach(function (r) {
+    var p = pos[periodOf(r[R_DATE], gran)];
+    if (p === undefined) return;
+    var v = metricOf(r, metric);
+    if (!v) return;
+    series[r[R_MOD]].values[p] += v;
+    used[r[R_MOD]] = 1;
+  });
+  return {periods: periods, series: series.filter(function (s) { return used[s.i]; }), used: used};
+}
+
+function renderTimeChart(host, data, normalize) {
+  var periods = data.periods, series = data.series;
+  var W = Math.max(320, host.clientWidth || 640);
+  var H = 250;
+  var M = {t: 10, r: 14, b: 30, l: 54};
+  var pw = W - M.l - M.r, ph = H - M.t - M.b;
+  var svg = mkSvg(host, W, H);
+  var n = periods.length;
+  var fmt = normalize ? fmtPct : METRICS[state.metric].fmt;
+  host.setAttribute('aria-label',
+    (normalize ? 'Mix de modelos' : METRICS[state.metric].label + ' por modelo') +
+    ', ' + n + ' periodos, ' + series.length + ' modelos');
+
+  if (!n || !series.length) {
+    txt(svg, M.l, H / 2, 'Sin datos en este rango', {color: 'var(--ink-2)', size: 13});
+    return;
+  }
+
+  var totals = new Array(n).fill(0);
+  series.forEach(function (s) { s.values.forEach(function (v, i) { totals[i] += v; }); });
+  var maxTotal = Math.max.apply(null, totals) || 1;
+  var ticks = normalize ? [0, 0.25, 0.5, 0.75, 1] : niceTicks(maxTotal, 4);
+  var domain = normalize ? 1 : ticks[ticks.length - 1];
+  var y = function (v) { return M.t + ph - (v / domain) * ph; };
+
+  ticks.forEach(function (t) {
+    var yy = Math.round(y(t)) + 0.5;
+    var g = node(svg, 'line', {x1: M.l, x2: M.l + pw, y1: yy, y2: yy});
+    g.style.stroke = t === 0 ? 'var(--axis)' : 'var(--grid)';
+    g.style.strokeWidth = '1';
+    txt(svg, M.l - 8, yy + 3, fmt(t), {anchor: 'end'});
+  });
+
+  // Cumulative tops, in fixed slot order so adjacency matches the validated palette.
+  var cum = series.map(function () { return new Array(n).fill(0); });
+  for (var i = 0; i < n; i++) {
+    var acc = 0;
+    var scale = normalize ? (totals[i] || 1) : 1;
+    for (var s = 0; s < series.length; s++) {
+      acc += series[s].values[i] / scale;
+      cum[s][i] = acc;
+    }
+  }
+
+  var band = pw / n;
+  var columns = n <= 60 && band >= 5;
+  var GAP = 2;
+
+  if (columns) {
+    var bw = Math.max(2, Math.min(24, band - GAP));
+    for (var p = 0; p < n; p++) {
+      if (!totals[p]) continue;
+      var x = M.l + p * band + (band - bw) / 2;
+      var topIdx = -1;
+      for (var k = series.length - 1; k >= 0; k--) {
+        if (series[k].values[p] > 0) { topIdx = k; break; }
+      }
+      var below = 0;
+      for (var q = 0; q < series.length; q++) {
+        var val = series[q].values[p] / (normalize ? (totals[p] || 1) : 1);
+        if (val <= 0) continue;
+        var yTop = y(below + val), yBot = y(below);
+        below += val;
+        var hh = yBot - yTop - (q === topIdx ? 0 : GAP);
+        if (hh < 0.6) hh = 0.6;
+        var path = node(svg, 'path', {
+          d: capPath(x, yTop, bw, hh, q === topIdx ? 4 : 0, 'top')
+        });
+        path.style.fill = series[q].color;
+      }
+    }
+  } else {
+    var px = function (i) { return M.l + (n === 1 ? pw / 2 : (i / (n - 1)) * pw); };
+    for (var a = 0; a < series.length; a++) {
+      var top = [], bot = [];
+      for (var j = 0; j < n; j++) {
+        var lower = a === 0 ? 0 : cum[a - 1][j];
+        top.push(px(j) + ' ' + y(cum[a][j]));
+        bot.push(px(j) + ' ' + y(lower));
+      }
+      var area = node(svg, 'path', {d: 'M' + top.join('L') + 'L' + bot.reverse().join('L') + 'Z'});
+      area.style.fill = series[a].color;
+    }
+    // The 2px separator is drawn in the surface colour: a gap, never a border.
+    for (var b = 0; b < series.length - 1; b++) {
+      var pts = [];
+      for (var m = 0; m < n; m++) pts.push(px(m) + ' ' + y(cum[b][m]));
+      var sep = node(svg, 'path', {d: 'M' + pts.join('L'), fill: 'none'});
+      sep.style.stroke = 'var(--surface)';
+      sep.style.strokeWidth = '2';
+    }
+  }
+
+  // x axis
+  var every = Math.max(1, Math.ceil(n / Math.max(2, Math.floor(pw / 64))));
+  for (var t2 = 0; t2 < n; t2 += every) {
+    var cx = columns ? M.l + t2 * band + band / 2
+                     : M.l + (n === 1 ? pw / 2 : (t2 / (n - 1)) * pw);
+    txt(svg, cx, H - M.b + 15, periodLabel(periods[t2], state.gran), {anchor: 'middle'});
+  }
+
+  // crosshair + tooltip (pointer and keyboard share one path)
+  var hair = node(svg, 'line', {x1: 0, x2: 0, y1: M.t, y2: M.t + ph});
+  hair.style.stroke = 'var(--axis)';
+  hair.style.strokeWidth = '1';
+  hair.style.display = 'none';
+  var active = -1;
+
+  function focusAt(idx, evt) {
+    if (idx < 0 || idx >= n) return;
+    active = idx;
+    var cx2 = columns ? M.l + idx * band + band / 2
+                      : M.l + (n === 1 ? pw / 2 : (idx / (n - 1)) * pw);
+    hair.setAttribute('x1', cx2); hair.setAttribute('x2', cx2);
+    hair.style.display = '';
+    var rows = series.map(function (s) {
+      return {v: s.values[idx], color: s.color, name: s.label};
+    }).filter(function (r) { return r.v > 0; })
+      .sort(function (a2, b2) { return b2.v - a2.v; })
+      .map(function (r) {
+        var share = totals[idx] ? r.v / totals[idx] : 0;
+        return {color: r.color, name: r.name,
+                value: normalize ? fmtPct(share) : METRICS[state.metric].fmt(r.v)};
+      });
+    if (!rows.length) rows = [{name: 'sin actividad', value: '-'}];
+    var origin = evt || {clientX: 0, clientY: 0};
+    if (!evt) {
+      var box = host.getBoundingClientRect();
+      origin = {clientX: box.left + cx2, clientY: box.top + M.t + ph / 2};
+    }
+    showTip(origin, periodTitle(periods[idx], state.gran), rows,
+            'Total: ' + METRICS[state.metric].fmt(totals[idx]) + ' ' + METRICS[state.metric].unit);
+  }
+
+  var overlay = node(svg, 'rect', {x: M.l, y: M.t, width: pw, height: ph, fill: 'transparent'});
+  overlay.style.cursor = 'crosshair';
+  overlay.addEventListener('pointermove', function (e) {
+    var box = svg.getBoundingClientRect();
+    var rel = e.clientX - box.left - M.l;
+    var idx = columns ? Math.floor(rel / band)
+                      : Math.round((rel / pw) * (n - 1));
+    focusAt(Math.max(0, Math.min(n - 1, idx)), e);
+  });
+  overlay.addEventListener('pointerleave', function () {
+    hair.style.display = 'none';
+    hideTip();
+  });
+  host.onkeydown = function (e) {
+    if (e.key !== 'ArrowLeft' && e.key !== 'ArrowRight') return;
+    e.preventDefault();
+    focusAt(active < 0 ? n - 1 : Math.max(0, Math.min(n - 1, active + (e.key === 'ArrowRight' ? 1 : -1))));
+  };
+  host.onblur = function () { hair.style.display = 'none'; hideTip(); };
+}
+
+function renderTimeTable(host, data, normalize) {
+  clear(host);
+  if (!data.periods.length || !data.series.length) {
+    host.appendChild(h('p', 'empty', 'Sin datos en este rango.'));
+    return;
+  }
+  var table = document.createElement('table');
+  var thead = document.createElement('thead');
+  var hr = document.createElement('tr');
+  hr.appendChild(h('th', null, 'Periodo'));
+  data.series.forEach(function (s) {
+    var th = h('th', 'n', s.label);
+    hr.appendChild(th);
+  });
+  hr.appendChild(h('th', 'n', 'Total'));
+  thead.appendChild(hr);
+  table.appendChild(thead);
+  var tb = document.createElement('tbody');
+  for (var i = data.periods.length - 1; i >= 0; i--) {
+    var total = 0;
+    data.series.forEach(function (s) { total += s.values[i]; });
+    if (!total) continue;
+    var tr = document.createElement('tr');
+    tr.appendChild(h('td', 'k', periodTitle(data.periods[i], state.gran)));
+    (function (idx, tot) {
+      data.series.forEach(function (s) {
+        var v = s.values[idx];
+        tr.appendChild(h('td', 'n', normalize ? (tot ? fmtPct(v / tot) : '-')
+                                              : METRICS[state.metric].fmt(v)));
+      });
+    })(i, total);
+    tr.appendChild(h('td', 'n k', normalize ? '100%' : METRICS[state.metric].fmt(total)));
+    tb.appendChild(tr);
+  }
+  table.appendChild(tb);
+  host.appendChild(table);
+}
+
+/* ---------- routing ---------- */
+function routingRows(sl) {
+  var by = {};
+  sl.daily.forEach(function (r) {
+    var m = r[R_MOD];
+    var cell = by[m] || (by[m] = {
+      i: m, label: D.models[m].label, color: SLOT_VAR[D.models[m].slot], total: 0,
+      role: [{reqs: 0, out: 0, read: 0}, {reqs: 0, out: 0, read: 0}]
+    });
+    var role = cell.role[r[R_ROLE]];
+    role.reqs += r[R_REQS];
+    role.out += r[R_OUT];
+    role.read += readOf(r);
+    cell.total += r[R_REQS];
+  });
+  return Object.keys(by).map(function (k) { return by[k]; })
+    .filter(function (r) { return r.total > 0; })
+    .sort(function (a, b) { return b.total - a.total; });
+}
+
+function renderRoleBars(host, rows) {
+  var W = Math.max(320, host.clientWidth || 640);
+  var rowH = 30, barH = 16;
+  var M = {t: 22, r: 62, b: 8, l: 84};
+  var H = M.t + rows.length * rowH + M.b;
+  var svg = mkSvg(host, W, Math.max(H, 60));
+  var pw = W - M.l - M.r;
+  host.setAttribute('aria-label', 'Requests por modelo repartidos entre agente principal y subagente');
+  if (!rows.length) { txt(svg, M.l, 30, 'Sin datos en este rango', {color: 'var(--ink-2)', size: 13}); return; }
+
+  var max = Math.max.apply(null, rows.map(function (r) { return r.total; })) || 1;
+  var ticks = niceTicks(max, 4);
+  var domain = ticks[ticks.length - 1];
+  ticks.forEach(function (t) {
+    var x = Math.round(M.l + (t / domain) * pw) + 0.5;
+    var g = node(svg, 'line', {x1: x, x2: x, y1: M.t - 6, y2: M.t + rows.length * rowH - 6});
+    g.style.stroke = t === 0 ? 'var(--axis)' : 'var(--grid)';
+    txt(svg, x, M.t - 11, fmtCompact(t), {anchor: 'middle'});
+  });
+
+  var marks = [];
+  rows.forEach(function (r, i) {
+    var y = M.t + i * rowH;
+    txt(svg, M.l - 10, y + barH / 2 + 4, r.label,
+        {anchor: 'end', color: 'var(--ink)', size: 12, tabular: false});
+    var x = M.l, drawn = 0;
+    var last = r.role[1].reqs > 0 ? 1 : 0;
+    ROLE.forEach(function (role, ri) {
+      var v = r.role[ri].reqs;
+      if (!v) return;
+      var w = (v / domain) * pw - (ri === last ? 0 : 2);
+      if (w < 0.8) w = 0.8;
+      var seg = node(svg, 'path', {d: capPath(x, y, w, barH, ri === last ? 4 : 0, 'right')});
+      seg.style.fill = role.color;
+      var det = [
+        {color: role.color, name: role.label + ' - requests', value: fmtNum(v)},
+        {name: 'output/request', value: fmtNum(r.role[ri].out / v)},
+        {name: 'contexto/request', value: fmtTok(r.role[ri].read / v)}
+      ];
+      var open = function (e) { showTip(e, r.label, det, fmtPct(v / r.total) + ' de los requests de este modelo'); };
+      seg.addEventListener('pointerenter', open);
+      seg.addEventListener('pointerleave', hideTip);
+      marks.push(function () { open(anchorOf(seg)); });
+      x += (v / domain) * pw;
+      drawn += v;
+    });
+    var subShare = r.total ? r.role[1].reqs / r.total : 0;
+    txt(svg, M.l + (drawn / domain) * pw + 8, y + barH / 2 + 4,
+        fmtPct(subShare) + ' sub', {color: 'var(--ink-2)', size: 11.5});
+  });
+  keyboardMarks(host, marks);
+}
+
+function renderPerReqBars(host, rows, field, fmt, label) {
+  var W = Math.max(300, host.clientWidth || 480);
+  var rowH = 34, barH = 11, gap = 2;
+  var M = {t: 22, r: 66, b: 8, l: 84};
+  var H = M.t + rows.length * rowH + M.b;
+  var svg = mkSvg(host, W, Math.max(H, 60));
+  var pw = W - M.l - M.r;
+  host.setAttribute('aria-label', label + ' por modelo, agente principal frente a subagente');
+  if (!rows.length) { txt(svg, M.l, 30, 'Sin datos en este rango', {color: 'var(--ink-2)', size: 13}); return; }
+
+  var vals = [];
+  rows.forEach(function (r) {
+    ROLE.forEach(function (_, ri) {
+      var c = r.role[ri];
+      if (c.reqs) vals.push(c[field] / c.reqs);
+    });
+  });
+  var max = Math.max.apply(null, vals.concat([1]));
+  var ticks = niceTicks(max, 3);
+  var domain = ticks[ticks.length - 1];
+  ticks.forEach(function (t) {
+    var x = Math.round(M.l + (t / domain) * pw) + 0.5;
+    var g = node(svg, 'line', {x1: x, x2: x, y1: M.t - 6, y2: M.t + rows.length * rowH - 8});
+    g.style.stroke = t === 0 ? 'var(--axis)' : 'var(--grid)';
+    txt(svg, x, M.t - 11, fmtCompact(t), {anchor: 'middle'});
+  });
+
+  var marks = [];
+  rows.forEach(function (r, i) {
+    var y0 = M.t + i * rowH;
+    txt(svg, M.l - 10, y0 + barH + 4, r.label,
+        {anchor: 'end', color: 'var(--ink)', size: 12, tabular: false});
+    ROLE.forEach(function (role, ri) {
+      var c = r.role[ri];
+      var y = y0 + ri * (barH + gap);
+      if (!c.reqs) {
+        txt(svg, M.l + 4, y + barH - 1, 'sin requests', {size: 10.5});
+        return;
+      }
+      var v = c[field] / c.reqs;
+      var w = Math.max(1, (v / domain) * pw);
+      var bar = node(svg, 'path', {d: capPath(M.l, y, w, barH, 4, 'right')});
+      bar.style.fill = role.color;
+      var det = [
+        {color: role.color, name: role.label + ' - ' + label.toLowerCase() + '/request', value: fmt(v)},
+        {name: 'requests', value: fmtNum(c.reqs)},
+        {name: 'output total', value: fmtTok(c.out)},
+        {name: 'contexto leído total', value: fmtTok(c.read)}
+      ];
+      var open = function (e) {
+        showTip(e, r.label + ' - ' + role.label, det,
+                c.reqs < MIN_PAIR_REQS ? 'Pocos requests: promedio inestable' : '');
+      };
+      bar.addEventListener('pointerenter', open);
+      bar.addEventListener('pointerleave', hideTip);
+      marks.push(function () { open(anchorOf(bar)); });
+      txt(svg, M.l + w + 7, y + barH - 1, fmt(v), {color: 'var(--ink-2)', size: 11});
+    });
+  });
+  keyboardMarks(host, marks);
+}
+
+function renderRoutingTable(host, rows) {
+  clear(host);
+  if (!rows.length) { host.appendChild(h('p', 'empty', 'Sin datos en este rango.')); return; }
+  var table = document.createElement('table');
+  var head = document.createElement('tr');
+  ['Modelo', 'Rol', 'Requests', '% del modelo', 'Output/req', 'Contexto/req', 'Contexto leído por token de output']
+    .forEach(function (c, i) { head.appendChild(h('th', i >= 2 ? 'n' : null, c)); });
+  var thead = document.createElement('thead');
+  thead.appendChild(head);
+  table.appendChild(thead);
+  var tb = document.createElement('tbody');
+  rows.forEach(function (r) {
+    ROLE.forEach(function (role, ri) {
+      var c = r.role[ri];
+      if (!c.reqs) return;
+      var tr = document.createElement('tr');
+      var td = h('td', 'k');
+      var dot = h('span', 'dot');
+      dot.style.background = r.color;
+      td.appendChild(dot);
+      td.appendChild(document.createTextNode(r.label));
+      tr.appendChild(td);
+      var roleTd = h('td');
+      var rdot = h('span', 'dot');
+      rdot.style.background = role.color;
+      roleTd.appendChild(rdot);
+      roleTd.appendChild(document.createTextNode(role.label));
+      tr.appendChild(roleTd);
+      tr.appendChild(h('td', 'n', fmtNum(c.reqs)));
+      tr.appendChild(h('td', 'n', fmtPct(c.reqs / r.total)));
+      tr.appendChild(h('td', 'n', fmtNum(c.out / c.reqs)));
+      tr.appendChild(h('td', 'n', fmtTok(c.read / c.reqs)));
+      tr.appendChild(h('td', 'n', c.out ? fmtNum(c.read / c.out) + ' : 1' : '-'));
+      tb.appendChild(tr);
+    });
+  });
+  table.appendChild(tb);
+  host.appendChild(table);
+}
+
+/* ---------- agents ---------- */
+function agentRows(sl) {
+  var by = {};
+  sl.daily.forEach(function (r) {
+    if (r[R_ROLE] !== 1 || r[R_AGENT] < 0) return;
+    var a = r[R_AGENT];
+    var cell = by[a] || (by[a] = {i: a, label: D.agents[a], reqs: 0, cr: 0, out: 0, models: {}});
+    var m = cell.models[r[R_MOD]] ||
+            (cell.models[r[R_MOD]] = {i: r[R_MOD], label: D.models[r[R_MOD]].label,
+                                      color: SLOT_VAR[D.models[r[R_MOD]].slot],
+                                      reqs: 0, cr: 0, out: 0});
+    cell.reqs += r[R_REQS]; cell.cr += r[R_CR]; cell.out += r[R_OUT];
+    m.reqs += r[R_REQS]; m.cr += r[R_CR]; m.out += r[R_OUT];
+  });
+  return Object.keys(by).map(function (k) {
+    var c = by[k];
+    // Segment order follows the model slot order, so stacked adjacency is
+    // always the pair list the palette was validated against.
+    c.mix = Object.keys(c.models).map(function (m) { return c.models[m]; })
+                  .sort(function (a, b) { return a.i - b.i; });
+    return c;
+  }).sort(function (a, b) { return b.cr - a.cr; });
+}
+
+function renderAgentStack(host, rows) {
+  var W = Math.max(320, host.clientWidth || 640);
+  var rowH = 30, barH = 16;
+  var M = {t: 22, r: 76, b: 8, l: 118};
+  var svg = mkSvg(host, W, Math.max(M.t + rows.length * rowH + M.b, 60));
+  var pw = W - M.l - M.r;
+  host.setAttribute('aria-label', 'Cache read por subagente, segmentado por modelo');
+  if (!rows.length) { txt(svg, M.l, 30, 'Sin requests de subagente en este rango', {color: 'var(--ink-2)', size: 13}); return; }
+
+  var max = Math.max.apply(null, rows.map(function (r) { return r.cr; })) || 1;
+  var ticks = niceTicks(max, 4);
+  var domain = ticks[ticks.length - 1];
+  ticks.forEach(function (t) {
+    var x = Math.round(M.l + (t / domain) * pw) + 0.5;
+    var g = node(svg, 'line', {x1: x, x2: x, y1: M.t - 6, y2: M.t + rows.length * rowH - 6});
+    g.style.stroke = t === 0 ? 'var(--axis)' : 'var(--grid)';
+    txt(svg, x, M.t - 11, fmtCompact(t), {anchor: 'middle'});
+  });
+
+  var marks = [];
+  rows.forEach(function (r, i) {
+    var y = M.t + i * rowH;
+    txt(svg, M.l - 10, y + barH / 2 + 4, r.label,
+        {anchor: 'end', color: 'var(--ink)', size: 12, tabular: false});
+    var x = M.l;
+    r.mix.forEach(function (m, mi) {
+      if (!m.cr) return;
+      var full = (m.cr / domain) * pw;
+      var w = Math.max(0.8, full - (mi === r.mix.length - 1 ? 0 : 2));
+      var seg = node(svg, 'path', {d: capPath(x, y, w, barH, mi === r.mix.length - 1 ? 4 : 0, 'right')});
+      seg.style.fill = m.color;
+      var det = [
+        {color: m.color, name: m.label + ' - cache read', value: fmtTok(m.cr)},
+        {name: 'requests', value: fmtNum(m.reqs)},
+        {name: 'output/request', value: fmtNum(m.out / Math.max(m.reqs, 1))},
+        {name: 'cache read/request', value: fmtTok(m.cr / Math.max(m.reqs, 1))}
+      ];
+      var open = function (e) { showTip(e, r.label, det, fmtPct(m.cr / (r.cr || 1)) + ' del cache read de este agente'); };
+      seg.addEventListener('pointerenter', open);
+      seg.addEventListener('pointerleave', hideTip);
+      marks.push(function () { open(anchorOf(seg)); });
+      x += full;
+    });
+    txt(svg, M.l + (r.cr / domain) * pw + 8, y + barH / 2 + 4,
+        fmtTok(r.cr), {color: 'var(--ink-2)', size: 11});
+  });
+  keyboardMarks(host, marks);
+}
+
+function renderAgentCompare(host, rows, field, fmt, label) {
+  var W = Math.max(300, host.clientWidth || 480);
+  var barH = 11, gap = 2, headH = 17, groupPad = 12;
+  var M = {t: 22, r: 106, b: 6, l: 14};
+  var groups = rows.map(function (r) {
+    return {label: r.label,
+            bars: r.mix.filter(function (m) { return m.reqs >= MIN_PAIR_REQS; })};
+  }).filter(function (g) { return g.bars.length; }).slice(0, 10);
+
+  var height = M.t + M.b;
+  groups.forEach(function (g) { height += headH + g.bars.length * (barH + gap) + groupPad; });
+  var svg = mkSvg(host, W, Math.max(height, 60));
+  var pw = W - M.l - M.r;
+  host.setAttribute('aria-label', label + ' por request, cada subagente comparado entre los modelos en que corrió');
+  if (!groups.length) { txt(svg, M.l, 30, 'Sin pares agente-modelo con suficientes requests', {color: 'var(--ink-2)', size: 13}); return; }
+
+  var vals = [];
+  groups.forEach(function (g) { g.bars.forEach(function (b) { vals.push(b[field] / b.reqs); }); });
+  var ticks = niceTicks(Math.max.apply(null, vals.concat([1])), 3);
+  var domain = ticks[ticks.length - 1];
+  ticks.forEach(function (t) {
+    var x = Math.round(M.l + (t / domain) * pw) + 0.5;
+    var g = node(svg, 'line', {x1: x, x2: x, y1: M.t - 6, y2: height - M.b});
+    g.style.stroke = t === 0 ? 'var(--axis)' : 'var(--grid)';
+    txt(svg, x, M.t - 11, fmtCompact(t), {anchor: 'middle'});
+  });
+
+  var y = M.t, marks = [];
+  groups.forEach(function (g) {
+    txt(svg, M.l, y + 11, g.label, {color: 'var(--ink)', size: 12, weight: '600', tabular: false});
+    y += headH;
+    g.bars.forEach(function (b) {
+      var v = b[field] / b.reqs;
+      var w = Math.max(1, (v / domain) * pw);
+      var bar = node(svg, 'path', {d: capPath(M.l, y, w, barH, 4, 'right')});
+      bar.style.fill = b.color;
+      var det = [
+        {color: b.color, name: label.toLowerCase() + '/request', value: fmt(v)},
+        {name: 'requests', value: fmtNum(b.reqs)},
+        {name: 'cache read total', value: fmtTok(b.cr)},
+        {name: 'output total', value: fmtTok(b.out)}
+      ];
+      var open = function (e) { showTip(e, g.label + ' en ' + b.label, det, ''); };
+      bar.addEventListener('pointerenter', open);
+      bar.addEventListener('pointerleave', hideTip);
+      marks.push(function () { open(anchorOf(bar)); });
+      // Direct label: value then the model name, both in text tokens. Identity
+      // never rests on hue alone - that is also the relief the light palette
+      // owes for its sub-3:1 slots.
+      var vLabel = txt(svg, M.l + w + 7, y + barH - 1, fmt(v), {color: 'var(--ink-2)', size: 11});
+      var vw = 0;
+      try { vw = vLabel.getComputedTextLength(); } catch (err) { vw = fmt(v).length * 6.6; }
+      txt(svg, M.l + w + 13 + vw, y + barH - 1, b.label, {size: 11, tabular: false});
+      y += barH + gap;
+    });
+    y += groupPad;
+  });
+  keyboardMarks(host, marks);
+}
+
+function renderAgentTable(host, rows) {
+  clear(host);
+  if (!rows.length) { host.appendChild(h('p', 'empty', 'Sin requests de subagente en este rango.')); return; }
+  var table = document.createElement('table');
+  var thead = document.createElement('thead');
+  var hr = document.createElement('tr');
+  ['Subagente', 'Modelo', 'Requests', 'Output/req', 'Cache read', 'Cache read/req', 'Cache read por token de output']
+    .forEach(function (c, i) { hr.appendChild(h('th', i >= 2 ? 'n' : null, c)); });
+  thead.appendChild(hr);
+  table.appendChild(thead);
+  var tb = document.createElement('tbody');
+  rows.forEach(function (r) {
+    r.mix.slice().sort(function (a, b) { return b.reqs - a.reqs; }).forEach(function (m, mi) {
+      var tr = document.createElement('tr');
+      tr.appendChild(h('td', 'k', mi === 0 ? r.label : ''));
+      var td = h('td');
+      var dot = h('span', 'dot');
+      dot.style.background = m.color;
+      td.appendChild(dot);
+      td.appendChild(document.createTextNode(m.label));
+      tr.appendChild(td);
+      tr.appendChild(h('td', 'n', fmtNum(m.reqs)));
+      tr.appendChild(h('td', 'n k', fmtNum(m.out / Math.max(m.reqs, 1))));
+      tr.appendChild(h('td', 'n', fmtTok(m.cr)));
+      tr.appendChild(h('td', 'n', fmtTok(m.cr / Math.max(m.reqs, 1))));
+      tr.appendChild(h('td', 'n', m.out ? fmtNum(m.cr / m.out) + ' : 1' : '-'));
+      tb.appendChild(tr);
+    });
+  });
+  table.appendChild(tb);
+  host.appendChild(table);
+}
+
+/* ---------- sessions ---------- */
+function sessionKey(s, key) {
+  if (key === 'reqs') return s[S_REQS];
+  if (key === 'output') return s[S_OUT];
+  if (key === 'active') return s[S_ACT];
+  if (key === 'rate') return s[S_ACT] >= 5 ? (s[S_IN] + s[S_CC] + s[S_CR]) / (s[S_ACT] / 60) : -1;
+  return s[S_IN] + s[S_CC] + s[S_CR];
+}
+function mixBar(mix, reqs, maxReqs) {
+  var host = document.createElement('div');
+  var W = 150, H = 12;
+  var svg = mkSvg(host, W, H);
+  var width = maxReqs ? Math.max(2, (reqs / maxReqs) * W) : 0;
+  var x = 0, total = 0;
+  mix.forEach(function (m) { total += m[1]; });
+  mix.forEach(function (m, i) {
+    var w = total ? (m[1] / total) * width : 0;
+    if (w <= 0) return;
+    var seg = node(svg, 'path', {d: capPath(x, 0, Math.max(0.8, w - (i === mix.length - 1 ? 0 : 2)), H, i === mix.length - 1 ? 4 : 0, 'right')});
+    seg.style.fill = SLOT_VAR[D.models[m[0]].slot];
+    var t = document.createElementNS(svg.NS, 'title');
+    t.textContent = D.models[m[0]].label + ': ' + fmtNum(m[1]) + ' requests';
+    seg.appendChild(t);
+    x += w;
+  });
+  return host;
+}
+function renderSessions(host, legendHost, sl) {
+  clear(host);
+  var rows = sl.sessions.slice().sort(function (a, b) {
+    return sessionKey(b, state.sort) - sessionKey(a, state.sort);
+  }).slice(0, +state.top);
+  var used = {};
+  rows.forEach(function (s) { s[S_MIX].forEach(function (m) { used[m[0]] = 1; }); });
+  legend(legendHost, modelItems(used));
+  if (!rows.length) { host.appendChild(h('p', 'empty', 'Sin sesiones en este rango.')); return; }
+  var maxReqs = Math.max.apply(null, rows.map(function (s) { return s[S_REQS]; })) || 1;
+
+  var table = document.createElement('table');
+  var thead = document.createElement('thead');
+  var hr = document.createElement('tr');
+  [['Fecha', ''], ['Cuenta', ''], ['id', ''], ['Activo', 'n'], ['Total', 'n'],
+   ['Mix de modelos (requests)', ''], ['Requests', 'n'], ['Sub', ''],
+   ['Contexto leído', 'n'], ['Output', 'n'], ['Intensidad/h', 'n'], ['Proyectos', '']]
+    .forEach(function (c) { hr.appendChild(h('th', c[1], c[0])); });
+  thead.appendChild(hr);
+  table.appendChild(thead);
+
+  var tb = document.createElement('tbody');
+  rows.forEach(function (s) {
+    var tr = document.createElement('tr');
+    tr.appendChild(h('td', 'k', s[S_DATE]));
+    tr.appendChild(h('td', null, D.accounts[s[S_ACC]]));
+    tr.appendChild(h('td', null, s[S_ID]));
+    tr.appendChild(h('td', 'n k', fmtDur(s[S_ACT])));
+    tr.appendChild(h('td', 'n', fmtDur(s[S_TOT])));
+    var mixTd = h('td', 'mix-cell');
+    mixTd.appendChild(mixBar(s[S_MIX], s[S_REQS], maxReqs));
+    tr.appendChild(mixTd);
+    tr.appendChild(h('td', 'n k', fmtNum(s[S_REQS])));
+    var subTd = h('td');
+    var meter = h('span', 'meter');
+    var track = h('span', 'track');
+    var fill = h('span', 'fill');
+    var share = s[S_REQS] ? s[S_SUB] / s[S_REQS] : 0;
+    fill.style.width = (100 * share) + '%';
+    track.appendChild(fill);
+    meter.appendChild(track);
+    meter.appendChild(h('span', null, fmtPct(share)));
+    subTd.appendChild(meter);
+    tr.appendChild(subTd);
+    tr.appendChild(h('td', 'n', fmtTok(s[S_IN] + s[S_CC] + s[S_CR])));
+    tr.appendChild(h('td', 'n', fmtTok(s[S_OUT])));
+    var rate = sessionKey(s, 'rate');
+    tr.appendChild(h('td', 'n', rate < 0 ? '-' : fmtTok(rate)));
+    tr.appendChild(h('td', null, s[S_PROJ].map(function (p) { return D.projects[p]; }).join(', ') || '-'));
+    tb.appendChild(tr);
+  });
+  table.appendChild(tb);
+  host.appendChild(table);
+}
+
+/* ---------- KPIs ---------- */
+function sparkline(values, color) {
+  var host = document.createElement('div');
+  var W = 130, H = 26;
+  var svg = mkSvg(host, W, H);
+  if (values.length < 2) return host;
+  var max = Math.max.apply(null, values) || 1;
+  var pts = values.map(function (v, i) {
+    return (i / (values.length - 1)) * (W - 6) + 3 + ' ' + (H - 3 - (v / max) * (H - 8));
+  });
+  var line = node(svg, 'path', {d: 'M' + pts.join('L'), fill: 'none'});
+  line.style.stroke = 'var(--spark)';
+  line.style.strokeWidth = '2';
+  line.style.strokeLinejoin = 'round';
+  line.style.strokeLinecap = 'round';
+  var last = pts[pts.length - 1].split(' ');
+  var dot = node(svg, 'circle', {cx: last[0], cy: last[1], r: 4});
+  dot.style.fill = color;
+  dot.style.stroke = 'var(--surface)';
+  dot.style.strokeWidth = '2';
+  return host;
+}
+function stripBar(parts, colors) {
+  var host = document.createElement('div');
+  var W = 220, H = 8;
+  var svg = mkSvg(host, W, H);
+  svg.setAttribute('width', '100%');
+  svg.setAttribute('preserveAspectRatio', 'none');
+  var total = parts.reduce(function (a, b) { return a + b; }, 0);
+  if (!total) return host;
+  var x = 0, lastIdx = -1;
+  parts.forEach(function (v, i) { if (v > 0) lastIdx = i; });
+  parts.forEach(function (v, i) {
+    if (v <= 0) return;
+    var w = (v / total) * W;
+    var seg = node(svg, 'path', {d: capPath(x, 0, Math.max(0.8, w - (i === lastIdx ? 0 : 2)), H, i === lastIdx ? 3 : 0, 'right')});
+    seg.style.fill = colors[i];
+    x += w;
+  });
+  return host;
+}
+function kpiCard(cls, label, value, note, extra) {
+  var card = h('div', 'kpi' + (cls ? ' ' + cls : ''));
+  card.appendChild(h('div', 'label', label));
+  card.appendChild(h('div', 'value', value));
+  if (note) card.appendChild(h('div', 'note', note));
+  if (extra) {
+    var box = h('div', 'strip');
+    box.appendChild(extra);
+    card.appendChild(box);
+  }
+  return card;
+}
+function renderKpis(host, sl, ts) {
+  clear(host);
+  var tot = {reqs: 0, sub: 0, out: 0, read: 0};
+  var subByFamily = {}, subTotal = 0;
+  var perModel = D.models.map(function () { return {reqs: 0, read: 0}; });
+  sl.daily.forEach(function (r) {
+    tot.reqs += r[R_REQS];
+    tot.out += r[R_OUT];
+    tot.read += readOf(r);
+    perModel[r[R_MOD]].reqs += r[R_REQS];
+    perModel[r[R_MOD]].read += readOf(r);
+    if (r[R_ROLE] === 1) {
+      tot.sub += r[R_REQS];
+      subTotal += r[R_REQS];
+      var f = D.families[r[R_FAM]];
+      subByFamily[f] = (subByFamily[f] || 0) + r[R_REQS];
+    }
+  });
+  var opusSub = subByFamily['opus'] || 0;
+  var colors = D.models.map(function (m) { return SLOT_VAR[m.slot]; });
+
+  // 12-period trend at the current granularity.
+  var sparkReqs = [], sparkRead = [];
+  var tail = ts.periods.slice(-12);
+  var offset = ts.periods.length - tail.length;
+  for (var i = 0; i < tail.length; i++) {
+    var a = 0;
+    ts.series.forEach(function (s) { a += s.values[offset + i]; });
+    sparkReqs.push(a);
+  }
+
+  host.appendChild(kpiCard('hero', 'Requests de subagente que corren en Opus',
+    subTotal ? fmtPct(opusSub / subTotal) : '-',
+    fmtNum(opusSub) + ' de ' + fmtNum(subTotal) + ' requests de subagente',
+    stripBar([opusSub, subTotal - opusSub], ['var(--role-sub)', 'var(--role-sub-track)'])));
+
+  host.appendChild(kpiCard(null, 'Requests', fmtNum(tot.reqs),
+    'desglose por modelo',
+    stripBar(perModel.map(function (m) { return m.reqs; }), colors)));
+
+  host.appendChild(kpiCard(null, 'Sesiones', fmtNum(sl.sessions.length),
+    'únicas, desde sessions.jsonl',
+    sparkline(sparkReqs, 'var(--s1)')));
+
+  host.appendChild(kpiCard(null, 'Requests de subagente',
+    tot.reqs ? fmtPct(tot.sub / tot.reqs) : '-',
+    fmtNum(tot.sub) + ' de ' + fmtNum(tot.reqs),
+    stripBar([tot.sub, tot.reqs - tot.sub], ['var(--role-sub)', 'var(--role-main)'])));
+
+  host.appendChild(kpiCard(null, 'Contexto leído', fmtTok(tot.read) + ' tok',
+    'desglose por modelo',
+    stripBar(perModel.map(function (m) { return m.read; }), colors)));
+
+  host.appendChild(kpiCard(null, 'Output', fmtTok(tot.out) + ' tok',
+    tot.reqs ? fmtNum(tot.out / tot.reqs) + ' tokens por request' : ''));
+}
+
+/* ---------- controls ---------- */
+function paintSegs() {
+  document.querySelectorAll('.seg').forEach(function (seg) {
+    var key = seg.dataset.key;
+    seg.querySelectorAll('button').forEach(function (b) {
+      b.setAttribute('aria-pressed', String(b.dataset.v === state[key]));
+    });
+  });
+}
+function buildAccountSeg() {
+  var seg = document.getElementById('seg-account');
+  clear(seg);
+  var opts = [['all', 'Todas']].concat(D.accounts.map(function (a) { return [a, a]; }));
+  opts.forEach(function (o) {
+    var b = document.createElement('button');
+    b.type = 'button';
+    b.dataset.v = o[0];
+    b.textContent = o[1];
+    seg.appendChild(b);
+  });
+}
+
+/* ---------- render ---------- */
+var pending = null;
+function render() {
+  var sl = slice();
+  var ts = buildTimeSeries(sl);
+
+  document.getElementById('head-sub').textContent =
+    'Histórico ' + (D.min || '?') + ' - ' + (D.max || '?') + ' · ' +
+    fmtNum(D.daily.length) + ' filas diarias, ' + fmtNum(D.sessions.length) + ' sesiones · ' +
+    'vista: ' + (sl.from || '?') + ' - ' + (sl.to || '?') + ' · generado ' + D.generated;
+
+  document.getElementById('t-volume-title').textContent = METRICS[state.metric].label + ' por modelo';
+  document.getElementById('t-volume-hint').textContent =
+    ts.periods.length + ' periodos · ' + (ts.periods.length <= 60 ? 'columnas apiladas' : 'áreas apiladas');
+
+  var items = modelItems(ts.used);
+  legend(document.getElementById('lg-volume'), items);
+  legend(document.getElementById('lg-mix'), items);
+  legend(document.getElementById('lg-role'), ROLE);
+  legend(document.getElementById('lg-out'), ROLE);
+  legend(document.getElementById('lg-read'), ROLE);
+
+  renderTimeChart(document.getElementById('ch-volume'), ts, false);
+  renderTimeChart(document.getElementById('ch-mix'), ts, true);
+  renderTimeTable(document.getElementById('tb-volume'), ts, false);
+  renderTimeTable(document.getElementById('tb-mix'), ts, true);
+
+  var rows = routingRows(sl);
+  renderRoleBars(document.getElementById('ch-role'), rows);
+  renderPerReqBars(document.getElementById('ch-out'), rows, 'out', fmtNum, 'Output');
+  renderPerReqBars(document.getElementById('ch-read'), rows, 'read', fmtTok, 'Contexto');
+  renderRoutingTable(document.getElementById('tb-routing'), rows);
+
+  var agents = agentRows(sl);
+  var agentUsed = {};
+  agents.forEach(function (a) { a.mix.forEach(function (m) { agentUsed[m.i] = 1; }); });
+  var agentItems = modelItems(agentUsed);
+  legend(document.getElementById('lg-agent'), agentItems);
+  legend(document.getElementById('lg-agent-out'), agentItems);
+  legend(document.getElementById('lg-agent-read'), agentItems);
+  renderAgentStack(document.getElementById('ch-agent'), agents);
+  renderAgentCompare(document.getElementById('ch-agent-out'), agents, 'out', fmtNum, 'Output');
+  renderAgentCompare(document.getElementById('ch-agent-read'), agents, 'cr', fmtTok, 'Cache read');
+  renderAgentTable(document.getElementById('tb-agent'), agents);
+
+  renderSessions(document.getElementById('tb-sessions'), document.getElementById('lg-sessions'), sl);
+  renderKpis(document.getElementById('kpis'), sl, ts);
+  paintSegs();
+}
+function schedule() {
+  if (pending) cancelAnimationFrame(pending);
+  pending = requestAnimationFrame(function () { pending = null; render(); });
+}
+
+buildAccountSeg();
+document.addEventListener('click', function (e) {
+  var b = e.target.closest ? e.target.closest('.seg button') : null;
+  if (!b) return;
+  var key = b.parentNode.dataset.key;
+  if (!key || state[key] === b.dataset.v) return;
+  state[key] = b.dataset.v;
+  hideTip();
+  render();
+});
+window.addEventListener('resize', schedule);
+render();
+})();
+</script>
+</body>
+</html>
+"""
+
+
+def render(payload) -> str:
+    text = json.dumps(payload, ensure_ascii=False, separators=(",", ":"))
+    # The payload lives in a <script type="application/json">; escaping these
+    # three keeps any project name from closing the tag.
+    text = (text.replace("&", "\\u0026")
+                .replace("<", "\\u003c")
+                .replace(">", "\\u003e"))
+    return TEMPLATE.replace("__PAYLOAD__", text)
+
+
+def main():
+    p = argparse.ArgumentParser(description=__doc__,
+                                formatter_class=argparse.RawDescriptionHelpFormatter)
+    p.add_argument("--out", default=os.path.join(DATA_DIR, "index.html"),
+                   help="ruta del HTML (por defecto %(default)s)")
+    p.add_argument("--data-dir", default=DATA_DIR,
+                   help="directorio con daily.jsonl y sessions.jsonl")
+    args = p.parse_args()
+
+    data_dir = os.path.expanduser(args.data_dir)
+    daily = load_jsonl(os.path.join(data_dir, "daily.jsonl"))
+    sessions = load_jsonl(os.path.join(data_dir, "sessions.jsonl"))
+    if not daily and not sessions:
+        print(f"render: sin datos en {data_dir} (¿corriste `claude-usage snapshot`?)",
+              file=sys.stderr)
+
+    out = os.path.expanduser(args.out)
+    os.makedirs(os.path.dirname(out) or ".", exist_ok=True)
+    tmp = out + ".tmp"
+    with open(tmp, "w") as fh:
+        fh.write(render(build_payload(daily, sessions)))
+    os.replace(tmp, out)
+
+    size = os.path.getsize(out)
+    print(f"render: {out} ({size / 1024:.0f} KB) | "
+          f"daily={len(daily):,} filas, sessions={len(sessions):,}")
+
+
+main()
